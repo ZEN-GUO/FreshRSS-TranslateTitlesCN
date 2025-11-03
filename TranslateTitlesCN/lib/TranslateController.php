@@ -2,53 +2,61 @@
 require_once('TranslationService.php');
 
 class TranslateController {
-    public function translateTitle($title) {
+    public function translateTitle($title, $serviceOverride = null, $targetOverride = null, $sourceOverride = 'auto') {
+        error_log('TranslateTitlesCN: Controller entered translateTitle()');
         if (empty($title)) {
-            error_log("TranslateTitlesCN: Empty title provided");
+            error_log('TranslateTitlesCN: Empty title provided');
             return '';
         }
 
-        $serviceType = FreshRSS_Context::$user_conf->TranslateService ?? 'google';
+        $serviceType = $serviceOverride ?? (FreshRSS_Context::$user_conf->TranslateService ?? 'google');
         $translationService = new TranslationService($serviceType);
+        $target = $targetOverride ?? (FreshRSS_Context::$user_conf->TargetLang ?? 'zh-cn');
+        $source = $sourceOverride ?? 'auto';
         $translatedTitle = '';
         $attempts = 0;
-        $sleepTime = 1; // 初始等待时间
+        $sleepTime = 1;
 
-        error_log("TranslateTitlesCN: Service: " . $serviceType . ", Title: " . $title);
+        error_log('TranslateTitlesCN: Service: ' . $serviceType . ', Title: ' . $title);
 
         while ($attempts < 2) {
             try {
-                $translatedTitle = $translationService->translate($title);
-                if (!empty($translatedTitle)) {
-                    error_log("TranslateTitlesCN: Translation successful: " . $translatedTitle);
-                    break;
-                }
-                error_log("TranslateTitlesCN: Empty translation result on attempt " . ($attempts + 1));
+                $translatedTitle = $translationService->translate($title, $target, $source);
             } catch (Exception $e) {
-                error_log("TranslateTitlesCN: Translation error on attempt " . ($attempts + 1) . " - " . $e->getMessage());
-                $attempts++;
+                error_log('TranslateTitlesCN: Translation exception on attempt ' . ($attempts + 1) . ' - ' . $e->getMessage());
+            }
+
+            if (!empty($translatedTitle)) {
+                error_log('TranslateTitlesCN: Translation successful: ' . $translatedTitle);
+                break;
+            }
+
+            $attempts++;
+            error_log('TranslateTitlesCN: Translation failed or empty on attempt ' . $attempts);
+            if ($attempts < 2) {
                 sleep($sleepTime);
-                $sleepTime *= 2; // 每次失败后增加等待时间
+                $sleepTime *= 2;
             }
         }
 
-        // 如果翻译失败且当前服务为DeeplX，则尝试使用谷歌翻译
-        if (empty($translatedTitle) && $serviceType == 'deeplx') {
-            error_log("TranslateTitlesCN: DeeplX failed, falling back to Google Translate");
+        $needsFallback = in_array($serviceType, ['deeplx', 'libre', 'openai'], true);
+
+        if (empty($translatedTitle) && $needsFallback) {
+            $svcName = strtoupper($serviceType);
+            error_log("TranslateTitlesCN: {$svcName} failed, falling back to Google Translate");
             $translationService = new TranslationService('google');
             try {
-                $translatedTitle = $translationService->translate($title);
+                $translatedTitle = $translationService->translate($title, $target, $source);
                 if (!empty($translatedTitle)) {
-                    error_log("TranslateTitlesCN: Google Translate fallback successful: " . $translatedTitle);
+                    error_log('TranslateTitlesCN: Google Translate fallback successful: ' . $translatedTitle);
                 }
             } catch (Exception $e) {
-                error_log("TranslateTitlesCN: Google Translate fallback failed - " . $e->getMessage());
+                error_log('TranslateTitlesCN: Google Translate fallback failed - ' . $e->getMessage());
             }
         }
 
-        // 如果翻译仍然失败，使用原始标题
         if (empty($translatedTitle)) {
-            error_log("TranslateTitlesCN: All translation attempts failed, returning original title");
+            error_log('TranslateTitlesCN: All translation attempts failed, returning original title');
             return $title;
         }
 

@@ -1,0 +1,351 @@
+Writing extensions for FreshRSS
+
+FreshRSS
+
+Documentation center
+
+View on GitHub Download.zip Download.tar.gz
+
+## Writing extensions for FreshRSS
+
+## About FreshRSS
+
+FreshRSS is an RSS / Atom feed aggregator written in PHP dating back to October 2012. The official site is located at freshrss.org and the official repository is hosted on GitHub: github.com/FreshRSS/FreshRSS.
+
+## The problem
+
+FreshRSS is limited in its technical possibilities by various factors:
+
+- The number of developers
+
+- The will to integrate certain changes
+
+- The level of "hacking" required to integrate marginal features
+
+While the first limitation can, in theory, be lifted by the participation of new contributors to the project, it depends on the willingness of contributors to take an interest in the source code of the entire project. In order to remove the other two limitations, most of the time it will be necessary to create a "fork".
+
+Another solution consists of an extension system. By allowing users to write their own extension without taking an interest in the core of the basic software, we allow for:
+
+1. Reducing the amount of source code a new contributor has to take in
+
+2. Unofficial integration of novelties
+
+3. No forking or main developer approval required.
+
+Note: it is quite conceivable that the functionalities of an extension can later be officially integrated into the FreshRSS code. Extensions make it easy to propose a proof of concept.
+
+## Minz Framework
+
+## Write an extension for FreshRSS
+
+Here we are! We've talked about the most useful features of Minz and how to run FreshRSS correctly and it's about time to address the extensions themselves.
+
+An extension allows you to easily add functionality to FreshRSS without having to touch the core of the project directly.
+
+## Make it work in Docker
+
+When working on an extension, it's easier to see it working directly in its environment. With Docker, you can leverage the use of the volume option when starting the container. Hopefully, you can use it without Docker-related knowledge by using the Makefile rule:
+
+make start extensions="/full/path/to/extension/1/full/path/to/extension/2"
+
+## Basic files and folders
+
+The first thing to note is that all extensions must be located in the extensions directory, at the base of the FreshRSS tree. An extension is a directory containing a set of mandatory (and optional) files and subdirectories. The convention requires that the main directory name be preceded by an "x" to indicate that it is not an extension included by default in FreshRSS.
+
+The main directory of an extension must contain at least two mandatory files:
+
+- A metadata.json file that contains a description of the extension. This file is written in JSON.
+
+- An extension.php file containing the entry point of the extension (which is a class that inherits Minz_Extension).
+
+Please note that there is a not a required link between the directory name of the extension and the name of the class inside extension.php , but you should follow our best practice: If you want to write a HelloWorld extension, the directory name should be xExtension-HelloWorld and the base class name HelloWorldExtension.
+
+In the file freshrss/extensions/xExtension-HelloWorld/extension.php you need the structure:
+
+https://freshrss.github.io/FreshRSS/en/developers/03_Backend/05_Extensions.html?utm_source=chatgpt.com
+
+---
+
+---
+
+final class HelloWorldExtension extends Minz_Extension \{
+
+	#[\\Override]
+
+---
+
+---
+
+11/3/25, 12:28 AM
+
+---
+
+	public function init(   ): void \{
+
+		parent::init(   );
+
+		// your code here
+
+	\}
+
+\}
+
+---
+
+There is an example HelloWorld extension that you can download from our GitHub repo.
+
+You may also need additional files or subdirectories depending on your needs:
+
+- configure.phtml is the file containing the form to parameterize your extension
+
+- A static/ directory containing CSS and JavaScript files that you will need for your extension (note that if you need to write a lot of CSS it may be more interesting to write a complete theme)
+
+- A Controllers directory containing additional controllers
+
+- An i18n directory containing additional translations
+
+- layout and views directories to define new views or to overwrite the current views
+
+In addition, it is good to have a LICENSE file indicating the license under which your extension is distributed and a README file giving a detailed description of it.
+
+## The metadata.json file
+
+The metadata.json file defines your extension through a number of important elements. It must contain a valid JSON array containing the following entries:
+
+- name : the name of your extension
+
+- author : your name, your e-mail address ... but there is no specific format to adopt
+
+- description : a description of your extension
+
+- version: the current version number of the extension
+
+- entrypoint: Indicates the entry point of your extension. It must match the name of the class contained in the file extension.php without the suffix Extension (so if the entry point is HelloWorld, your class will be called HelloWorldExtension)
+
+- type : Defines the type of your extension. There are two types: system and user . We will study this difference right after.
+
+Only the name and entrypoint fields are required.
+
+## Choosing between system and user
+
+A user extension can be enabled by some users and not by others (typically for user preferences).
+
+## Writing your own extension.php
+
+This file is the core of your extension. It must define some key elements to be loaded by the extension system:
+
+1. The class name must be the entrypoint value defined in the metadata.json file suffixed by Extension (if your entrypoint value is HelloWorld, your class name will be HelloWorldExtension).
+
+2. The class must extend the Minz_Extension abstract class which defines the core methods and properties of a FreshRSS extension.
+
+3. The class must define the init method. This method is called only if the extension is loaded. Its purpose is to initialize the extension and its behavior during every page load.
+
+The Minz_Extension abstract class defines a set of methods that can be overridden to fit your needs:
+
+- the install method is called when the user enables the extension in the configuration page. It must return true when successful and a string containing an error message when not. Its purpose is to prepare FreshRSS for the extension (adding a table to the database, creating a folder tree, ...).
+
+- the uninstall method is called when the user disables the extension in the configuration page. It must return true when successful and a string containing an error message when not. Its purpose is to clean FreshRSS (removing a table from the database, deleting a folder tree, ...). Usually it reverts changes introduced by the install method.
+
+- the handleConfigureAction method is called when a user loads the extension configuration panel. It contains the logic to validate and store the submitted values defined in the configure.phtml file.
+
+If your extension code is scattered in different classes, you need to load their source before using them. Of course you could include the files manually, but it's more efficient to load them automatically. To do so, you just need to define the autoload method which will include them when needed. This method will be registered automatically when the extension is enabled.
+
+The Minz_Extension abstract class defines another set of methods that should not be overridden:
+
+- the getName, getEntrypoint, getPath, getAuthor, getDescription, getVersion, and getType methods return the extension internal properties. Those properties are extracted from the metadata.json file.
+
+- getFileUrl(string \$filename, bool \$isStatic = true): string will return the URL to a file in the static directory. The first parameter is the name of the file (without static/ ). Set \$isStatic to true for user-independent files, and to false for files saved in a user's own directory.
+
+- the registerController method register an extension controller in FreshRSS. The selected controller must be defined in the extension Controllers folder, its file name must be \\\\ <name\\>Controller.php , and its class name must be FreshExtension_\\<name\\>_Controller .
+
+- the registerViews method registers the extension views in FreshRSS.
+
+- the registerTranslates method registers the extension translation files in FreshRSS.
+
+- the registerHook method registers hook actions in different part of the application.
+
+- the getSystemConfiguration method retrieves the extension configuration for the system.
+
+- the setSystemConfiguration method stores the extension configuration for the system.
+
+- the removeSystemConfiguration method removes the extension configuration for the system.
+
+- the getUserConfiguration method retrieves the extension configuration for the current user.
+
+- the setUserConfiguration method stores the extension configuration for the current user.
+
+- the removeUserConfiguration method removes the extension configuration for the current user.
+
+Note that if you modify the later set of methods, you might break the extension system. Thus making FreshRSS unusable. So it's highly recommended to let those unmodified.
+
+## The "hooks" system
+
+You can register at the FreshRSS event system in an extensions init(   ) method, to manipulate data when some of the core functions are executed. The last parameter is the priority of the hook when triggered. The hook with the lowest priority value are triggered first. The default priority is 0.
+
+---
+
+final class HelloWorldExtension extends Minz_Extension
+
+\{
+
+	#[\\Override]
+
+	public function init(   ): void \{
+
+		parent::init(   );
+
+		\$this->registerHook(Minz_HookType::EntryBeforeDisplay, [\$this, 'renderEntry'
+
+		\$this->registerHook(Minz_HookType::CheckUrlBeforeAdd, [self::class, 'checkUr
+
+	\}
+
+	public function renderEntry(FreshRSS_Entry \$entry): FreshRSS_Entry \{
+
+		\$message = \$this->getUserConfigurationValue('message');
+
+		\$entry->_content("<h1>\{\$message\}</h1>" . \$entry->content(   ));
+
+		return \$entry;
+
+	\}
+
+---
+
+https://freshrss.github.io/FreshRSS/en/developers/03_Backend/05_Extensions.html?utm_source=chatgpt.com
+
+---
+
+	public static function checkUrlBeforeAdd(string \$url): string \{
+
+		if (str_starts_with(\$url, 'https://')) \{
+
+			return \$url;
+
+		\}
+
+		return null;
+
+	\}
+
+\}
+
+---
+
+The following events are available:
+
+- api_misc (function(   ): void): to allow extensions to have their own API endpoint on /api/misc.php/Extension%20Name/ or /api/misc.php?ext=Extension%20Name.
+
+- before_login_btn (function(   ): string ): Allows to insert HTML before the login button. Applies to the create button on the register page as well. Example use case is inserting a captcha widget.
+
+- check_url_before_add ( function(\$url) -> Url | null ): will be executed every time a URL is added. The URL itself will be passed as parameter. This way a website known to have feeds which doesn't advertise it in the header can still be automatically supported.
+
+- custom_favicon_btn_url (function(FreshRSS_Feed \$feed): string | null ): Allows extensions to implement a button for setting a custom favicon for individual feeds by providing an URL. The URL will be sent a POST request with the extAction field set to either query_icon_info or update_icon, along with an id field which describes the feed's ID. Example response for a query_icon_info request:
+
+---
+
+\{"extName": "YouTube Video Feed", "iconUrl": ".\\/f.php?h=40838a43"\}
+
+---
+
+- custom_favicon_hash (function(FreshRSS_Feed \$feed): string | null ): Enables the modification of custom favicon hashes by returning params from the hook function. The hook should check if the customFaviconExt attribute of \$feed is set to the extension's name before returning a custom value. Otherwise, the return value should be null.
+
+- entry_auto_read (function(FreshRSS_Entry \$entry, string \$why): void): Triggered when an entry is automatically marked as read. The why parameter supports the rules \{ filter , upon_reception, same_title_in_feed \}.
+
+- entry_auto_unread (function(FreshRSS_Entry \$entry, string \$why): void): Triggered when an entry is automatically marked as unread. The why parameter supports the rules \{updated_article\}.
+
+- entry_before_display (function(\$entry) -> Entry | null): will be executed every time an entry is rendered. The entry itself (instance of FreshRSS_Entry) will be passed as parameter.
+
+- entry_before_insert (function(\$entry) -> Entry | null): will be executed when a feed is refreshed and new entries will be imported into the database. The new entry (instance of FreshRSS_Entry) will be passed as parameter.
+
+- entry_before_add (function(\$entry) -> Entry | null):will be executed when a feed is refreshed and just before an entry is added to the database. Useful for reading the final state of the entry after filter actions have been applied. The new entry (instance of FreshRSS_Entry) will be passed as parameter.
+
+- entry_before_update (function(\$entry) -> Entry | null ): will be executed when a feed is refreshed and just before an entry is updated in the database. Useful for reading the final state of the entry after filter actions have been applied. The updated entry (instance of FreshRSS_Entry) will be passed as parameter.
+
+- feed_before_actualize (function(\$feed) -> Feed | null ): will be executed when a feed is updated. The feed (instance of FreshRSS_Feed) will be passed as parameter.
+
+- feed_before_insert (function(\$feed) -> Feed | null): will be executed when a new feed is imported into the database. The new feed (instance of FreshRSS_Feed) will be passed as parameter.
+
+- freshrss_init (function(   ) -> none ): will be executed at the end of the initialization of FreshRSS, useful to initialize components or to do additional access checks.
+
+- freshrss_user_maintenance (function(   ) -> none):will be executed for each user during the actualize_script, useful to run some maintenance tasks on the user.
+
+- js_vars (function(\$vars = array) -> array | null ): will be executed if the jsonVars in the header will be generated.
+
+- menu_admin_entry (function(   ) -> string): add an entry at the end of the "Administration" menu, the returned string must be valid HTML (e.g. <li class="item active"><a href="url">New entry</a></li>).
+
+- menu_configuration_entry (function(   ) -> string): add an entry at the end of the "Configuration" menu, the returned string must be valid HTML (e.g. <li class="item active"> <a href="url">New entry</a></li>).
+
+- menu_other_entry (function(   ) -> string): add an entry at the end of the header dropdown menu (i.e. after the "About" entry), the returned string must be valid HTML (e.g. <li class="item active"><a href="url">New entry</a></li>).
+
+- nav_entries (function(   ) -> string): will add DOM elements before the navigation buttons.
+
+- nav_menu (function(   ) -> string): will be executed if the navigation was built.
+
+- nav_reading_modes (function(\$reading_modes) -> array | null ): TODO add documentation.
+
+- post_update (function(none) -> none ): TODO add documentation.
+
+- simplepie_after_init (function(\\SimplePie\\SimplePie \$simplePie, FreshRSS_Feed \$feed, bool \$result): void ): Triggered after fetching an RSS/Atom feed with SimplePie. Useful for instance to get the HTTP response headers (e.g. \$simplePie->data['headers']).
+
+- simplepie_before_init (function(\\SimplePie\\SimplePie \$simplePie, FreshRSS_Feed \$feed): void ): Triggered before fetching an RSS/Atom feed with SimplePie.
+
+- view_modes (function(array<FreshRSS_ViewMode> \$viewModes): array|null ): Allow extensions to register additional view modes than normal, reader, global.
+
+I Note: the simplepie_* hooks are only fired for feeds using SimplePie via pull, i.e. normal RSS/Atom feeds. This excludes WebSub (push), and the various HTML or JSON Web scraping methods.
+
+## JavaScript events
+
+---
+
+function use_context(   ) \{
+
+	// Something that refers to the window.context
+
+\}
+
+if (document.readyState && document.readyState !== 'loading' && typeof window.context !== 'u
+
+	use_context(   );
+
+\} else \{
+
+	document.addEventListener('freshrss:globalContextLoaded', use_context, false);
+
+\}
+
+---
+
+<icon/>
+
+The following events are available:
+
+- freshrss:globalContextLoaded: will be dispatched after load the global context variable, useful for referencing variables injected with the js_vars hook.
+
+## Injecting CDN content
+
+When using the init method, it is possible to inject scripts from CDN using the Minz_View::appendScript directive. FreshRSS will include the script in the page but will not load it since it will be blocked by the default content security policy (CSP). To amend the existing CSP, you need to define the extension CSP policies:
+
+---
+
+// in the extension.php file
+
+protected array \$csp_policies = [
+
+	'default-src' => 'example.org',
+
+];
+
+---
+
+This will only amend the extension CSP to FreshRSS CSP.
+
+## Writing your own configure.phtml
+
+When you want to support user configurations for your extension or simply display some information, you have to create the configure.phtml file.
+
+11/3/25, 12:28 AM Writing extensions for FreshRSS
+
+## FreshRSS is maintained by FreshRSS.
+
+This page was generated by GitHub Pages.

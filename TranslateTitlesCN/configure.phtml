@@ -1,66 +1,219 @@
-<form action="<?php echo _url('extension', 'configure', 'e', urlencode($this->getName())); ?>" method="post">
+<?php
+$languageOptions = [
+    'cs'    => 'Čeština',
+    'de'    => 'Deutsch',
+    'el'    => 'Ελληνικά',
+    'en'    => 'English',
+    'en-us' => 'English (United States)',
+    'es'    => 'Español',
+    'fa'    => 'فارسی',
+    'fi'    => 'Suomi',
+    'fr'    => 'Français',
+    'he'    => 'עברית',
+    'hu'    => 'Magyar',
+    'id'    => 'Bahasa Indonesia',
+    'it'    => 'Italiano',
+    'ja'    => '日本語',
+    'ko'    => '한국어',
+    'lv'    => 'Latviešu',
+    'nl'    => 'Nederlands',
+    'oc'    => 'Occitan',
+    'pl'    => 'Polski',
+    'pt-br' => 'Português (Brasil)',
+    'pt-pt' => 'Português (Portugal)',
+    'ru'    => 'Русский',
+    'sk'    => 'Slovenčina',
+    'tr'    => 'Türkçe',
+    'uk'    => 'Українська',
+    'zh-cn' => '简体中文',
+    'zh-tw' => '繁體中文',
+];
+
+$serviceOptions = [
+    'google' => '谷歌翻译',
+    'deeplx' => 'DeeplX',
+    'libre'  => 'LibreTranslate',
+    'openai' => 'OpenAI 兼容',
+];
+
+$currentLanguage = strtolower((string)(FreshRSS_Context::$user_conf->TargetLang ?? 'zh-cn'));
+$currentService = FreshRSS_Context::$user_conf->TranslateService ?? 'google';
+$currentDisplayMode = FreshRSS_Context::$user_conf->ContentDisplayMode ?? 'orig_then_trans';
+$titleEnabled = (bool)(FreshRSS_Context::$user_conf->TranslateTitleEnabled ?? true);
+$contentEnabled = (bool)(FreshRSS_Context::$user_conf->TranslateContentEnabled ?? false);
+$translationMode = 'title_only';
+if ($titleEnabled && $contentEnabled) {
+    $translationMode = 'title_and_content';
+} elseif (!$titleEnabled && $contentEnabled) {
+    $translationMode = 'content_only';
+}
+$openAiBaseUrl = FreshRSS_Context::$user_conf->OpenAIBaseUrl ?? '';
+if ($openAiBaseUrl === '') {
+    $openAiBaseUrl = 'https://api.openai.com/v1/';
+}
+?>
+
+<?php if (isset($this->testResult)): ?>
+    <div class="message <?php echo $this->testResult['success'] ? 'success' : 'error'; ?>">
+        <?php echo $this->testResult['message']; ?>
+    </div>
+<?php endif; ?>
+
+<!-- 翻译测试表单 -->
+<div class="form-group">
+    <label class="group-name"><h3>测试翻译</h3></label>
+    <div class="group-controls">
+        <form action="<?php echo _url('extension', 'configure', 'e', 'TranslateTitlesCN'); ?>" method="post" class="form-test-translation">
+            <input type="hidden" name="_csrf" value="<?php echo FreshRSS_Auth::csrfToken(); ?>" />
+            <div class="form-group">
+                <textarea name="test-text" rows="3" style="width: 100%" placeholder="在此输入要测试翻译的文本..."></textarea>
+            </div>
+            <div class="form-group">
+                <label class="group-name" for="test-translate-service">测试翻译服务：</label>
+                <div class="group-controls">
+                    <select name="TranslateService" id="test-translate-service">
+                        <?php foreach ($serviceOptions as $value => $label): ?>
+                            <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentService === $value) ? 'selected="selected"' : ''; ?>>
+                                <?php echo htmlspecialchars($label); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="group-name" for="test-language">目标语言：</label>
+                <div class="group-controls">
+                    <select name="language" id="test-language" data-leave-validation="zh-cn">
+                        <?php foreach ($languageOptions as $value => $label): ?>
+                            <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentLanguage === $value) ? 'selected="selected"' : ''; ?>>
+                                <?php echo htmlspecialchars($label); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <button type="submit" class="btn btn-important">测试翻译</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<hr style="margin: 2em 0;" />
+
+<!-- 主设置表单 -->
+<form action="<?php echo _url('extension', 'configure', 'e', 'TranslateTitlesCN'); ?>" method="post">
     <input type="hidden" name="_csrf" value="<?php echo FreshRSS_Auth::csrfToken(); ?>" />
-    <!-- 翻译服务选择 -->
+
+    <!-- 展示模式 -->
     <div class="form-group">
-        <label class="group-name">选择翻译服务:</label>
+        <label class="group-name" for="content-display-mode">展示模式</label>
         <div class="group-controls">
-            <div class="form-group">
-                <input type="radio" id="translate-service-deeplx" name="TranslateService" value="deeplx" required <?php echo (FreshRSS_Context::$user_conf->TranslateService == 'deeplx' ? 'checked' : ''); ?>>
-                <span for="translate-service-deeplx">DeepLX</span>
-            </div>
-            <div class="form-group">
-                <input type="radio" id="translate-service-google" name="TranslateService" value="google" <?php echo (FreshRSS_Context::$user_conf->TranslateService == 'google' ? 'checked' : ''); ?>>
-                <span for="translate-service-google">谷歌翻译</span>
-            </div>
-            <div class="form-group">
-                <input type="radio" id="translate-service-libre" name="TranslateService" value="libre" <?php echo (FreshRSS_Context::$user_conf->TranslateService == 'libre' ? 'checked' : ''); ?>>
-                <span for="translate-service-libre">LibreTranslate</span>
-            </div>
+            <select name="ContentDisplayMode" id="content-display-mode">
+                <option value="translated_only" <?php echo ($currentDisplayMode === 'translated_only') ? 'selected="selected"' : ''; ?>>替换显示（仅显示译文）</option>
+                <option value="trans_then_orig" <?php echo ($currentDisplayMode === 'trans_then_orig') ? 'selected="selected"' : ''; ?>>追加显示（译文+原文）</option>
+                <option value="orig_then_trans" <?php echo ($currentDisplayMode === 'orig_then_trans') ? 'selected="selected"' : ''; ?>>追加显示（原文+译文）</option>
+            </select>
         </div>
     </div>
 
-    <!-- DeepLX API URL 设置 -->
+    <!-- 功能开关 -->
     <div class="form-group">
-        <label class="group-name" for="deeplx-api-url">DeepLX API地址:</label>
+        <label class="group-name" for="translation-mode">功能开关</label>
         <div class="group-controls">
-            <input id="deeplx-api-url" name="DeeplxApiUrl" type="text" value="<?php echo FreshRSS_Context::$user_conf->DeeplxApiUrl; ?>">
+            <select name="TranslationMode" id="translation-mode">
+                <option value="title_only" <?php echo ($translationMode === 'title_only') ? 'selected="selected"' : ''; ?>>仅标题翻译</option>
+                <option value="content_only" <?php echo ($translationMode === 'content_only') ? 'selected="selected"' : ''; ?>>仅正文翻译</option>
+                <option value="title_and_content" <?php echo ($translationMode === 'title_and_content') ? 'selected="selected"' : ''; ?>>标题+正文翻译</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- 目标语言 -->
+    <div class="form-group">
+        <label class="group-name" for="language">目标语言</label>
+        <div class="group-controls">
+            <select name="language" id="language" data-leave-validation="zh-cn">
+                <?php foreach ($languageOptions as $value => $label): ?>
+                    <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentLanguage === $value) ? 'selected="selected"' : ''; ?>>
+                        <?php echo htmlspecialchars($label); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+    </div>
+
+    <!-- 翻译服务 -->
+    <div class="form-group">
+        <label class="group-name" for="translate-service">选择翻译服务</label>
+        <div class="group-controls">
+            <select name="TranslateService" id="translate-service">
+                <?php foreach ($serviceOptions as $value => $label): ?>
+                    <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentService === $value) ? 'selected="selected"' : ''; ?>>
+                        <?php echo htmlspecialchars($label); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+    </div>
+
+    <!-- DeepLX 设置 -->
+    <div class="form-group">
+        <label class="group-name" for="deeplx-api-url">DeepLX API URL</label>
+        <div class="group-controls">
+            <input id="deeplx-api-url" name="DeeplxApiUrl" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->DeeplxApiUrl ?? ''); ?>">
         </div>
     </div>
 
     <!-- LibreTranslate 设置 -->
     <div class="form-group">
-        <label class="group-name" for="libre-api-url">LibreTranslate 服务器地址:</label>
+        <label class="group-name" for="libre-api-url">LibreTranslate API URL</label>
         <div class="group-controls">
-            <input id="libre-api-url" name="LibreApiUrl" type="text" value="<?php echo FreshRSS_Context::$user_conf->LibreApiUrl; ?>">
+            <input id="libre-api-url" name="LibreApiUrl" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->LibreApiUrl ?? ''); ?>">
         </div>
     </div>
     <div class="form-group">
-        <label class="group-name" for="libre-api-key">LibreTranslate API Key (可选):</label>
+        <label class="group-name" for="libre-api-key">LibreTranslate API Key</label>
         <div class="group-controls">
-            <input id="libre-api-key" name="LibreApiKey" type="text" value="<?php echo FreshRSS_Context::$user_conf->LibreApiKey; ?>">
+            <input id="libre-api-key" name="LibreApiKey" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->LibreApiKey ?? ''); ?>">
         </div>
     </div>
 
+    <!-- OpenAI 设置 -->
+    <div class="form-group">
+        <label class="group-name" for="openai-base-url">OpenAI 兼容 API URL</label>
+        <div class="group-controls">
+            <input id="openai-base-url" name="OpenAIBaseUrl" type="text" value="<?php echo htmlspecialchars($openAiBaseUrl); ?>">
+        </div>
+    </div>
+    <div class="form-group">
+        <label class="group-name" for="openai-api-key">OpenAI API Key</label>
+        <div class="group-controls">
+            <input id="openai-api-key" name="OpenAIAPIKey" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->OpenAIAPIKey ?? ''); ?>">
+        </div>
+    </div>
+
+    <hr style="margin: 2em 0;" />
+
     <!-- 订阅源翻译设置 -->
     <div class="form-group">
-        <label class="group-name">订阅源翻译设置:</label>
+        <label class="group-name">订阅源翻译设置</label>
         <div class="group-controls">
-            <?php 
+            <?php
             $feeds = FreshRSS_Factory::createFeedDao()->listFeeds();
             if (empty($feeds)): ?>
                 <span>暂无订阅源，请添加后重试</span>
             <?php else: ?>
                 <?php foreach ($feeds as $id => $feed): ?>
-                <li class="form-group">
-                    <span class="feed-name"><?php echo $feed->name(); ?></span>
-                    <input type="checkbox" id="feed-<?php echo $id; ?>" name="TranslateTitles[<?php echo $id; ?>]" value="1" <?php if (isset(FreshRSS_Context::$user_conf->TranslateTitles[$id]) && FreshRSS_Context::$user_conf->TranslateTitles[$id] == '1') echo ' checked="checked"'; ?>>
-                </li>
+                    <div class="form-group">
+                        <input type="checkbox" name="TranslateTitles[<?php echo $id; ?>]" value="1" <?php echo (!empty(FreshRSS_Context::$user_conf->TranslateTitles[$id]) && FreshRSS_Context::$user_conf->TranslateTitles[$id] == '1') ? 'checked="checked"' : ''; ?>>
+                        <span class="feed-name" style="margin-left:0.5em;"><?php echo htmlspecialchars($feed->name()); ?></span>
+                    </div>
                 <?php endforeach; ?>
             <?php endif; ?>
         </div>
     </div>
 
-    <!-- 提交与取消按钮 -->
     <div class="form-group form-actions">
         <div class="group-controls">
             <button type="submit" class="btn btn-important"><?php echo _t('gen.action.submit'); ?></button>
