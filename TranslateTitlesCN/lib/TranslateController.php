@@ -2,7 +2,7 @@
 require_once('TranslationService.php');
 
 class TranslateController {
-    public function translateTitle($title, $serviceOverride = null, $targetOverride = null, $sourceOverride = 'auto') {
+    public function translateTitle($title, $serviceOverride = null, $targetOverride = null, $sourceOverride = 'auto', $serviceOptions = array()) {
         error_log('TranslateTitlesCN: Controller entered translateTitle()');
         if (empty($title)) {
             error_log('TranslateTitlesCN: Empty title provided');
@@ -10,7 +10,7 @@ class TranslateController {
         }
 
         $serviceType = $serviceOverride ?? (FreshRSS_Context::$user_conf->TranslateService ?? 'google');
-        $translationService = new TranslationService($serviceType);
+        $translationService = new TranslationService($serviceType, $serviceOptions);
         $target = $targetOverride ?? (FreshRSS_Context::$user_conf->TargetLang ?? 'zh-cn');
         $source = $sourceOverride ?? 'auto';
         $translatedTitle = '';

@@ -53,54 +53,6 @@ if ($openAiBaseUrl === '') {
 }
 ?>
 
-<?php if (isset($this->testResult)): ?>
-    <div class="message <?php echo $this->testResult['success'] ? 'success' : 'error'; ?>">
-        <?php echo $this->testResult['message']; ?>
-    </div>
-<?php endif; ?>
-
-<!-- 翻译测试表单 -->
-<div class="form-group">
-    <label class="group-name"><h3>测试翻译</h3></label>
-    <div class="group-controls">
-        <form action="<?php echo _url('extension', 'configure', 'e', 'TranslateTitlesCN'); ?>" method="post" class="form-test-translation">
-            <input type="hidden" name="_csrf" value="<?php echo FreshRSS_Auth::csrfToken(); ?>" />
-            <div class="form-group">
-                <textarea name="test-text" rows="3" style="width: 100%" placeholder="在此输入要测试翻译的文本..."></textarea>
-            </div>
-            <div class="form-group">
-                <label class="group-name" for="test-translate-service">测试翻译服务：</label>
-                <div class="group-controls">
-                    <select name="TranslateService" id="test-translate-service">
-                        <?php foreach ($serviceOptions as $value => $label): ?>
-                            <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentService === $value) ? 'selected="selected"' : ''; ?>>
-                                <?php echo htmlspecialchars($label); ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label class="group-name" for="test-language">目标语言：</label>
-                <div class="group-controls">
-                    <select name="language" id="test-language" data-leave-validation="zh-cn">
-                        <?php foreach ($languageOptions as $value => $label): ?>
-                            <option value="<?php echo htmlspecialchars($value); ?>" <?php echo ($currentLanguage === $value) ? 'selected="selected"' : ''; ?>>
-                                <?php echo htmlspecialchars($label); ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <button type="submit" class="btn btn-important">测试翻译</button>
-            </div>
-        </form>
-    </div>
-</div>
-
-<hr style="margin: 2em 0;" />
-
 <!-- 主设置表单 -->
 <form action="<?php echo _url('extension', 'configure', 'e', 'TranslateTitlesCN'); ?>" method="post">
     <input type="hidden" name="_csrf" value="<?php echo FreshRSS_Auth::csrfToken(); ?>" />
@@ -190,6 +142,23 @@ if ($openAiBaseUrl === '') {
         <label class="group-name" for="openai-api-key">OpenAI API Key</label>
         <div class="group-controls">
             <input id="openai-api-key" name="OpenAIAPIKey" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->OpenAIAPIKey ?? ''); ?>">
+        </div>
+    </div>
+    <div class="form-group">
+        <label class="group-name" for="openai-model">OpenAI 模型</label>
+        <div class="group-controls">
+            <input id="openai-model" name="OpenAIModel" type="text" value="<?php echo htmlspecialchars(FreshRSS_Context::$user_conf->OpenAIModel ?? 'gpt-3.5-turbo'); ?>" placeholder="例如：gpt-4o-mini, qwen-mt-turbo">
+        </div>
+    </div>
+    <div class="form-group">
+        <label class="group-name" for="openai-prompt">OpenAI 系统提示词</label>
+        <div class="group-controls">
+            <textarea id="openai-prompt" name="OpenAITranslationPrompt" rows="4" placeholder="可选：自定义系统提示词，支持 {{target_lang}} / {{target_lang_name}} 等占位符"><?php echo htmlspecialchars(FreshRSS_Context::$user_conf->OpenAITranslationPrompt ?? ''); ?></textarea>
+        </div>
+    </div>
+    <div class="form-group">
+        <div class="group-controls">
+            <button type="submit" class="btn" name="DoTranslateTest" value="1">测试连接（仅验证 URL/Key）</button>
         </div>
     </div>
 

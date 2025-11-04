@@ -3,6 +3,7 @@
 class TranslationService {
     private const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
     private const DEFAULT_OPENAI_MODEL = 'gpt-3.5-turbo';
+    private const DEFAULT_OPENAI_PROMPT = 'You are a translation engine. Translate the user messages{{source_instruction}} into {{target_lang_name}} (locale: {{target_lang}}). Answer with the translated text only.';
 
     private static $languageNames = [
         'cs'    => 'Czech',
@@ -42,8 +43,9 @@ class TranslationService {
     private $openAiBaseUrl;
     private $openAiApiKey;
     private $openAiModel;
+    private $openAiPrompt;
 
-    public function __construct($serviceType) {
+    public function __construct($serviceType, $overrides = null) {
         $this->serviceType = $serviceType;
         $this->deeplxBaseUrl = rtrim((string)(FreshRSS_Context::$user_conf->DeeplxApiUrl ?? ''), '/');
         $this->googleBaseUrl = self::GOOGLE_ENDPOINT;
@@ -52,6 +54,32 @@ class TranslationService {
         $this->openAiBaseUrl = rtrim((string)(FreshRSS_Context::$user_conf->OpenAIBaseUrl ?? ''), '/');
         $this->openAiApiKey = (string)(FreshRSS_Context::$user_conf->OpenAIAPIKey ?? '');
         $this->openAiModel = (string)(FreshRSS_Context::$user_conf->OpenAIModel ?? self::DEFAULT_OPENAI_MODEL);
+        $this->openAiPrompt = trim((string)(FreshRSS_Context::$user_conf->OpenAITranslationPrompt ?? ''));
+
+        // Apply per-request overrides for testing without saving config
+        if (is_array($overrides) && !empty($overrides)) {
+            if (!empty($overrides['DeeplxApiUrl'])) {
+                $this->deeplxBaseUrl = rtrim((string)$overrides['DeeplxApiUrl'], '/');
+            }
+            if (!empty($overrides['LibreApiUrl'])) {
+                $this->libreBaseUrl = rtrim((string)$overrides['LibreApiUrl'], '/');
+            }
+            if (array_key_exists('LibreApiKey', $overrides)) {
+                $this->libreApiKey = (string)$overrides['LibreApiKey'];
+            }
+            if (!empty($overrides['OpenAIBaseUrl'])) {
+                $this->openAiBaseUrl = rtrim((string)$overrides['OpenAIBaseUrl'], '/');
+            }
+            if (array_key_exists('OpenAIAPIKey', $overrides)) {
+                $this->openAiApiKey = (string)$overrides['OpenAIAPIKey'];
+            }
+            if (!empty($overrides['OpenAIModel'])) {
+                $this->openAiModel = (string)$overrides['OpenAIModel'];
+            }
+            if (array_key_exists('OpenAITranslationPrompt', $overrides)) {
+                $this->openAiPrompt = trim((string)$overrides['OpenAITranslationPrompt']);
+            }
+        }
     }
 
     public function translate($text, $target = 'zh-cn', $source = 'auto') {
@@ -75,6 +103,201 @@ class TranslationService {
         }
     }
 
+    /**
+     * 仅验证联通性/凭据：不以译文正确性为准
+     * 返回 [ok=>bool, message=>string]
+     */
+    public function testConnectivity($target = 'en', $source = 'auto') {
+        try {
+            switch ($this->serviceType) {
+                case 'libre':
+                    return $this->testLibreConnectivity();
+                case 'deeplx':
+                    return $this->testDeeplxConnectivity();
+                case 'openai':
+                    return $this->testOpenAiConnectivity($target, $source);
+                case 'google':
+                default:
+                    return $this->testGoogleConnectivity($target, $source);
+            }
+        } catch (Exception $e) {
+            error_log('[TT][TEST] exception: ' . $e->getMessage());
+            return ['ok' => false, 'message' => $e->getMessage()];
+        }
+    }
+
+    private function parseHttpStatus($headers) {
+        if (!is_array($headers) || empty($headers)) return null;
+        $line = $headers[0];
+        if (preg_match('/\s(\d{3})\s/', $line, $m)) {
+            return intval($m[1]);
+        }
+        return null;
+    }
+
+    private function testGoogleConnectivity($target, $source) {
+        $queryParams = http_build_query([
+            'client' => 'gtx',
+            'sl' => ($source ?: 'auto'),
+            'tl' => $this->formatGoogleLanguage($target),
+            'dt' => 't',
+            'q' => 'ping',
+        ]);
+        $url = $this->googleBaseUrl . '?' . $queryParams;
+        $opts = ['http' => ['method' => 'GET', 'timeout' => 5, 'ignore_errors' => true]];
+        $ctx = stream_context_create($opts);
+        $result = @file_get_contents($url, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][google] status=' . $status);
+        if ($status === 200 && $result !== false) {
+            return ['ok' => true, 'message' => 'Google 接口连通'];
+        }
+        return ['ok' => false, 'message' => 'Google 接口不可用（HTTP ' . ($status ?? 0) . ')'];
+    }
+
+    private function testDeeplxConnectivity() {
+        if ($this->deeplxBaseUrl === '') {
+            return ['ok' => false, 'message' => 'DeeplX URL 未配置'];
+        }
+        $payload = ['text' => 'PING', 'source_lang' => 'auto', 'target_lang' => 'EN'];
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        $opts = ['http' => [
+            'method' => 'POST',
+            'header' => 'Content-Type: application/json',
+            'content' => $json,
+            'timeout' => 5,
+            'ignore_errors' => true,
+        ]];
+        $ctx = stream_context_create($opts);
+        $res = @file_get_contents($this->deeplxBaseUrl, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][deeplx] status=' . $status);
+        if ($status === 200 && $res !== false) {
+            return ['ok' => true, 'message' => 'DeeplX 接口连通'];
+        }
+        return ['ok' => false, 'message' => 'DeeplX 接口不可用（HTTP ' . ($status ?? 0) . ')'];
+    }
+
+    private function testLibreConnectivity() {
+        if ($this->libreBaseUrl === '') {
+            return ['ok' => false, 'message' => 'LibreTranslate URL 未配置'];
+        }
+        // 先 GET /languages
+        $url = $this->libreBaseUrl . '/languages';
+        $opts = ['http' => [
+            'method' => 'GET',
+            'header' => 'Content-Type: application/json',
+            'timeout' => 5,
+            'ignore_errors' => true,
+        ]];
+        $ctx = stream_context_create($opts);
+        $res = @file_get_contents($url, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][libre] GET /languages status=' . $status);
+        if ($status === 200 && $res !== false) {
+            return ['ok' => true, 'message' => 'LibreTranslate 接口连通'];
+        }
+        // 若需要校验 key，则尝试一次最小翻译
+        $apiUrl = $this->libreBaseUrl . '/translate';
+        $post = ['q' => 'ping', 'source' => 'auto', 'target' => 'en', 'format' => 'text'];
+        if ($this->libreApiKey !== '') { $post['api_key'] = $this->libreApiKey; }
+        $json = json_encode($post, JSON_UNESCAPED_UNICODE);
+        $opts = ['http' => [
+            'method' => 'POST',
+            'header' => 'Content-Type: application/json',
+            'content' => $json,
+            'timeout' => 8,
+            'ignore_errors' => true,
+        ]];
+        $ctx = stream_context_create($opts);
+        $res = @file_get_contents($apiUrl, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][libre] POST /translate status=' . $status);
+        if ($status === 200 && $res !== false) {
+            return ['ok' => true, 'message' => 'LibreTranslate 接口连通（含 Key 验证）'];
+        }
+        return ['ok' => false, 'message' => 'LibreTranslate 接口不可用（HTTP ' . ($status ?? 0) . ')'];
+    }
+
+    private function testOpenAiConnectivity($target, $source) {
+        if ($this->openAiBaseUrl === '') {
+            return ['ok' => false, 'message' => 'OpenAI Base URL 未配置'];
+        }
+        if ($this->openAiApiKey === '') {
+            return ['ok' => false, 'message' => 'OpenAI API Key 未配置'];
+        }
+        $variant = $this->detectOpenAiVariant($this->openAiBaseUrl);
+        $headers = [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $this->openAiApiKey,
+        ];
+        if ($variant === 'openrouter') {
+            $headers[] = 'HTTP-Referer: https://github.com/FreshRSS/FreshRSS';
+            $headers[] = 'X-Title: TranslateTitlesCN';
+        }
+        // 尝试 GET /models
+        $url = rtrim($this->openAiBaseUrl, '/') . '/models';
+        $opts = ['http' => [
+            'method' => 'GET',
+            'header' => $headers,
+            'timeout' => 8,
+            'ignore_errors' => true,
+        ]];
+        $ctx = stream_context_create($opts);
+        $res = @file_get_contents($url, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][openai] GET /models status=' . $status . ' variant=' . $variant);
+        if ($status === 200 && $res !== false) {
+            return ['ok' => true, 'message' => 'OpenAI 兼容接口连通（/models）'];
+        }
+        if ($status === 401 || $status === 403) {
+            return ['ok' => false, 'message' => 'OpenAI 认证失败（HTTP ' . $status . ')'];
+        }
+        // Fallback: POST /chat/completions（校验 URL/Key；若模型错误也视为连通）
+        $endpoint = rtrim($this->openAiBaseUrl, '/') . '/chat/completions';
+        $payload = [
+            'model' => ($this->openAiModel ?: self::DEFAULT_OPENAI_MODEL),
+            'messages' => [ ['role' => 'user', 'content' => 'PING'] ],
+            'max_tokens' => 1,
+            'temperature' => 0,
+        ];
+        if ($variant === 'qwen') {
+            $payload['extra_body'] = [ 'translation_options' => [ 'source_lang' => 'auto', 'target_lang' => 'en' ] ];
+        }
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        $opts = ['http' => [
+            'method' => 'POST',
+            'header' => $headers,
+            'content' => $json,
+            'timeout' => 10,
+            'ignore_errors' => true,
+        ]];
+        $ctx = stream_context_create($opts);
+        $res = @file_get_contents($endpoint, false, $ctx);
+        $status = $this->parseHttpStatus($http_response_header ?? []);
+        error_log('[TT][TEST][openai] POST /chat/completions status=' . $status);
+        if ($status === 200 && $res !== false) {
+            return ['ok' => true, 'message' => 'OpenAI 兼容接口连通（/chat/completions）'];
+        }
+        // 解析错误体，若为模型错误则视为连通
+        if ($res !== false) {
+            $resp = json_decode($res, true);
+            $errMsg = '';
+            if (is_array($resp)) {
+                if (!empty($resp['error']['message'])) { $errMsg = $resp['error']['message']; }
+                if (!empty($resp['error']['type'])) { $errMsg .= ' [' . $resp['error']['type'] . ']'; }
+                if (stripos($errMsg, 'model') !== false) {
+                    return ['ok' => true, 'message' => 'OpenAI 连接正常，但模型无效：' . $errMsg];
+                }
+            }
+            if ($status === 401 || $status === 403) {
+                return ['ok' => false, 'message' => 'OpenAI 认证失败（HTTP ' . $status . '）'];
+            }
+            return ['ok' => false, 'message' => 'OpenAI 接口不可用（HTTP ' . ($status ?? 0) . '）' . ($errMsg ? '：' . $errMsg : '')];
+        }
+        return ['ok' => false, 'message' => 'OpenAI 接口不可用（HTTP ' . ($status ?? 0) . ')'];
+    }
+
     private function translateWithLibre($text, $target, $source) {
         if ($this->libreBaseUrl === '') {
             error_log('LibreTranslate base URL is not configured.');
@@ -83,12 +306,17 @@ class TranslationService {
 
         $apiUrl = $this->libreBaseUrl . '/translate';
 
+        $sourceCode = ($source === 'auto') ? 'auto' : $this->mapLibreLanguageCode($source);
+        $targetCode = $this->mapLibreLanguageCode($target);
+
         $postData = [
             'q' => $text,
-            'source' => ($source ?: 'auto'),
-            'target' => $target,
+            'source' => $sourceCode,
+            'target' => $targetCode,
             'format' => 'text',
         ];
+
+        error_log('LibreTranslate request url=' . $apiUrl . ' source=' . $sourceCode . ' target=' . $targetCode);
 
         if ($this->libreApiKey !== '') {
             $postData['api_key'] = $this->libreApiKey;
@@ -251,6 +479,8 @@ class TranslationService {
         }
 
         $endpoint = $this->openAiBaseUrl . '/chat/completions';
+        $variant = $this->detectOpenAiVariant($this->openAiBaseUrl);
+        error_log('OpenAI-compatible request endpoint=' . $endpoint . ' variant=' . $variant . ' model=' . ($this->openAiModel ?: self::DEFAULT_OPENAI_MODEL));
 
         return $this->translateWithOpenAiCompatible(
             $text,
@@ -258,11 +488,12 @@ class TranslationService {
             $source,
             $endpoint,
             $this->openAiApiKey,
-            $this->openAiModel ?: self::DEFAULT_OPENAI_MODEL
+            $this->openAiModel ?: self::DEFAULT_OPENAI_MODEL,
+            $variant
         );
     }
 
-    private function translateWithOpenAiCompatible($text, $target, $source, $endpoint, $apiKey, $model) {
+    private function translateWithOpenAiCompatible($text, $target, $source, $endpoint, $apiKey, $model, $variant = 'generic') {
         $payload = [
             'model' => $model,
             'temperature' => 0,
@@ -278,18 +509,34 @@ class TranslationService {
             ],
         ];
 
+        if ($variant === 'qwen') {
+            $payload['extra_body'] = [
+                'translation_options' => [
+                    'source_lang' => $source === 'auto' ? 'auto' : $source,
+                    'target_lang' => $target,
+                ],
+            ];
+        }
+
         $jsonData = json_encode($payload, JSON_UNESCAPED_UNICODE);
         if ($jsonData === false) {
             error_log('OpenAI-compatible payload encoding failed.');
             return '';
         }
 
+        $headers = [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $apiKey,
+        ];
+
+        if ($variant === 'openrouter') {
+            $headers[] = 'HTTP-Referer: https://github.com/FreshRSS/FreshRSS';
+            $headers[] = 'X-Title: TranslateTitlesCN';
+        }
+
         $options = [
             'http' => [
-                'header' => [
-                    'Content-Type: application/json',
-                    'Authorization: Bearer ' . $apiKey,
-                ],
+                'header' => $headers,
                 'method' => 'POST',
                 'content' => $jsonData,
                 'timeout' => 15,
@@ -330,6 +577,66 @@ class TranslationService {
         return '';
     }
 
+    private function detectOpenAiVariant($baseUrl) {
+        $host = $this->extractHostFromUrl($baseUrl);
+        if ($host === null) {
+            return 'generic';
+        }
+
+        $host = strtolower($host);
+        if (strpos($host, 'openrouter.ai') !== false) {
+            return 'openrouter';
+        }
+        if (strpos($host, 'aliyuncs.com') !== false || strpos($host, 'dashscope') !== false) {
+            return 'qwen';
+        }
+        if (strpos($host, 'siliconflow.cn') !== false) {
+            return 'siliconflow';
+        }
+        if (strpos($host, 'openai.com') !== false) {
+            return 'openai';
+        }
+
+        return 'generic';
+    }
+
+    private function extractHostFromUrl($url) {
+        $parsed = @parse_url($url, PHP_URL_HOST);
+        if (!empty($parsed)) {
+            return $parsed;
+        }
+
+        // 兼容缺少 scheme 的配置
+        $withScheme = @parse_url('https://' . ltrim((string)$url, '/'), PHP_URL_HOST);
+        return $withScheme ?: null;
+    }
+
+    private function mapLibreLanguageCode($code) {
+        $code = strtolower(str_replace('_', '-', trim((string)$code)));
+        if ($code === '' || $code === 'auto') {
+            return 'auto';
+        }
+
+        $map = [
+            'zh-cn' => 'zh',
+            'zh-tw' => 'zh',
+            'en-us' => 'en',
+            'pt-br' => 'pt',
+            'pt-pt' => 'pt',
+        ];
+
+        if (isset($map[$code])) {
+            return $map[$code];
+        }
+
+        if (strpos($code, '-') !== false) {
+            [$primary] = explode('-', $code, 2);
+            return $primary;
+        }
+
+        return $code;
+    }
+
     private function normalizeLanguageCode($code, $allowAuto) {
         $code = strtolower(str_replace('_', '-', trim((string)$code)));
         if ($allowAuto && ($code === '' || $code === 'auto')) {
@@ -357,14 +664,23 @@ class TranslationService {
 
     private function buildSystemPrompt($target, $source) {
         $targetName = $this->describeLanguage($target);
+        $sourceName = $this->describeLanguage($source);
         $sourceInstruction = '';
         if ($source !== 'auto' && $source !== '') {
-            $sourceName = $this->describeLanguage($source);
             $sourceInstruction = ' from ' . $sourceName . ' (locale: ' . $source . ')';
         }
 
-        return 'You are a translation engine. Translate the user messages' . $sourceInstruction .
-            ' into ' . $targetName . ' (locale: ' . $target . '). Answer with the translated text only.';
+        $template = ($this->openAiPrompt !== '') ? $this->openAiPrompt : self::DEFAULT_OPENAI_PROMPT;
+
+        $replacements = [
+            '{{target_lang}}' => $target,
+            '{{target_lang_name}}' => $targetName,
+            '{{source_lang}}' => $source,
+            '{{source_lang_name}}' => $sourceName,
+            '{{source_instruction}}' => $sourceInstruction,
+        ];
+
+        return strtr($template, $replacements);
     }
 
     private function describeLanguage($code) {

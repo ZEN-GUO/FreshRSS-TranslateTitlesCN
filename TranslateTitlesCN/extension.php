@@ -75,6 +75,10 @@ class TranslateTitlesExtension extends Minz_Extension {
             FreshRSS_Context::$user_conf->OpenAIModel = 'gpt-3.5-turbo';
         }
 
+        if (is_null(FreshRSS_Context::$user_conf->OpenAITranslationPrompt)) {
+            FreshRSS_Context::$user_conf->OpenAITranslationPrompt = '';
+        }
+
         // 避免每次请求都保存配置，保留在配置动作中保存
 
         error_log('TranslateTitlesCN: Hooks registered');
@@ -82,38 +86,50 @@ class TranslateTitlesExtension extends Minz_Extension {
     }
 
     public function handleConfigureAction() {
-        // 处理配置请求（包含翻译测试与保存配置）
+        // 处理配置请求（保存用户自定义的翻译设置）
         if (Minz_Request::isPost()) {
-            // 优先处理翻译测试：当 POST 中携带 test-text，则不保存配置，仅执行测试
-            $testText = Minz_Request::param('test-text', '');
-            if (!empty($testText)) {
+            // 测试按钮：仅测试连接，不保存配置
+            if (Minz_Request::hasParam('DoTranslateTest')) {
+                $testService = Minz_Request::param('TranslateService', FreshRSS_Context::$user_conf->TranslateService ?? 'google');
+                $testTarget = Minz_Request::param('language', FreshRSS_Context::$user_conf->TargetLang ?? 'zh-cn');
+                // 汇总覆盖参数（使用表单中当前值进行测试）
+                $overrides = [
+                    'DeeplxApiUrl' => Minz_Request::param('DeeplxApiUrl', FreshRSS_Context::$user_conf->DeeplxApiUrl ?? ''),
+                    'LibreApiUrl' => Minz_Request::param('LibreApiUrl', FreshRSS_Context::$user_conf->LibreApiUrl ?? ''),
+                    'LibreApiKey' => Minz_Request::param('LibreApiKey', FreshRSS_Context::$user_conf->LibreApiKey ?? ''),
+                    'OpenAIBaseUrl' => Minz_Request::param('OpenAIBaseUrl', FreshRSS_Context::$user_conf->OpenAIBaseUrl ?? ''),
+                    'OpenAIAPIKey' => Minz_Request::param('OpenAIAPIKey', FreshRSS_Context::$user_conf->OpenAIAPIKey ?? ''),
+                    'OpenAIModel' => Minz_Request::param('OpenAIModel', FreshRSS_Context::$user_conf->OpenAIModel ?? 'gpt-3.5-turbo'),
+                    'OpenAITranslationPrompt' => Minz_Request::param('OpenAITranslationPrompt', FreshRSS_Context::$user_conf->OpenAITranslationPrompt ?? ''),
+                ];
                 try {
-                    $translateController = new TranslateController();
-                    $testService = Minz_Request::param('TranslateService', FreshRSS_Context::$user_conf->TranslateService ?? 'google');
-                    $testTarget = Minz_Request::param('language', FreshRSS_Context::$user_conf->TargetLang ?? 'zh-cn');
-                    $translatedText = $translateController->translateTitle($testText, $testService, $testTarget);
-                    error_log('[TT] TEST service=' . $testService . ' title=' . $testText . ' result=' . $translatedText);
-                    if (!empty($translatedText)) {
+                    error_log('[TT][TEST] Start connectivity service=' . $testService . ' target=' . $testTarget);
+                    $svc = new TranslationService($testService, $overrides);
+                    $probe = $svc->testConnectivity($testTarget, 'auto');
+                    $ok = is_array($probe) && !empty($probe['ok']);
+                    $msg = is_array($probe) && isset($probe['message']) ? (string)$probe['message'] : '';
+                    if ($ok) {
                         Minz_Session::_param('notification', [
                             'type' => 'good',
-                            'content' => '翻译结果：' . $translatedText,
+                            'content' => '连接正常：' . htmlspecialchars($msg, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
                         ]);
+                        error_log('[TT][TEST] OK ' . $msg);
                     } else {
                         Minz_Session::_param('notification', [
                             'type' => 'error',
-                            'content' => '翻译失败，请检查翻译服务配置',
+                            'content' => '连接失败：' . htmlspecialchars($msg, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
                         ]);
+                        error_log('[TT][TEST] FAIL ' . $msg);
                     }
                 } catch (Exception $e) {
                     Minz_Session::_param('notification', [
                         'type' => 'error',
-                        'content' => $e->getMessage(),
+                        'content' => '测试异常：' . $e->getMessage(),
                     ]);
+                    error_log('[TT][TEST] EXCEPTION ' . $e->getMessage());
                 }
-                // 测试分支结束，直接返回（不保存配置）。核心控制器会继续渲染配置页。
-                return;
+                return; // 不保存配置，直接返回
             }
-
             $allowedServices = ['google', 'deeplx', 'libre', 'openai'];
             $translateService = Minz_Request::param('TranslateService', FreshRSS_Context::$user_conf->TranslateService ?? 'google');
             if (!in_array($translateService, $allowedServices, true)) {
@@ -191,11 +207,18 @@ class TranslateTitlesExtension extends Minz_Extension {
             if ($openaiBase === '') {
                 $openaiBase = 'https://api.openai.com/v1/';
             }
-            $openaiKey = Minz_Request::param('OpenAIAPIKey', '');
-            $openaiModel = Minz_Request::param('OpenAIModel', 'gpt-3.5-turbo');
+            $openaiBase = rtrim($openaiBase, '/');
+            $openaiKey = trim((string)Minz_Request::param('OpenAIAPIKey', ''));
+            $openaiModel = trim((string)Minz_Request::param('OpenAIModel', FreshRSS_Context::$user_conf->OpenAIModel ?? 'gpt-3.5-turbo'));
+            if ($openaiModel === '') {
+                $openaiModel = 'gpt-3.5-turbo';
+            }
+            $openaiPrompt = trim((string)Minz_Request::param('OpenAITranslationPrompt', FreshRSS_Context::$user_conf->OpenAITranslationPrompt ?? ''));
+
             FreshRSS_Context::$user_conf->OpenAIBaseUrl = $openaiBase;
             FreshRSS_Context::$user_conf->OpenAIAPIKey = $openaiKey;
             FreshRSS_Context::$user_conf->OpenAIModel = $openaiModel;
+            FreshRSS_Context::$user_conf->OpenAITranslationPrompt = $openaiPrompt;
 
             // 保存并记录结果
             $saveResult = FreshRSS_Context::$user_conf->save();
