@@ -26,9 +26,10 @@ class TranslateTitlesExtension extends Minz_Extension {
         }
 
         $this->registerHook('feed_before_insert', array($this, 'addTranslationOption'));
-        $this->registerHook('entry_before_insert', array($this, 'translateTitle'));
-        // 在展示阶段处理内容翻译与包裹逻辑（只翻一次，变更自动失效）
-        $this->registerHook('entry_before_display', array($this, 'onEntryBeforeDisplay'));
+        // 仅在新增/更新稳定阶段触发翻译，不在 insert（过滤中）阶段
+        $this->registerHook('entry_before_add', array($this, 'onEntryBeforeAdd'));
+        // 更新条目的 Hook
+        $this->registerHook('entry_before_update', array($this, 'onEntryBeforeUpdate'));
 
         if (is_null(FreshRSS_Context::$user_conf->TranslateService)) {
             FreshRSS_Context::$user_conf->TranslateService = 'google';
@@ -127,6 +128,28 @@ class TranslateTitlesExtension extends Minz_Extension {
                         'content' => '测试异常：' . $e->getMessage(),
                     ]);
                     error_log('[TT][TEST] EXCEPTION ' . $e->getMessage());
+                }
+                return; // 不保存配置，直接返回
+            }
+
+            if (Minz_Request::hasParam('DoForceUpdate')) {
+                $limit = (int)Minz_Request::param('ForceUpdateCount', 10);
+                if ($limit <= 0) { $limit = 10; }
+                try {
+                    $summary = $this->forceUpdateSelectedFeeds($limit);
+                    $ok = !empty($summary['ok']);
+                    $msg = $summary['message'] ?? '';
+                    Minz_Session::_param('notification', [
+                        'type' => $ok ? 'good' : 'error',
+                        'content' => ($ok ? '强制更新完成：' : '强制更新失败：') . htmlspecialchars($msg, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'),
+                    ]);
+                    error_log('[TT][FORCE] ' . ($ok ? 'OK ' : 'FAIL ') . $msg);
+                } catch (Exception $e) {
+                    Minz_Session::_param('notification', [
+                        'type' => 'error',
+                        'content' => '强制更新异常：' . $e->getMessage(),
+                    ]);
+                    error_log('[TT][FORCE] EXCEPTION ' . $e->getMessage());
                 }
                 return; // 不保存配置，直接返回
             }
@@ -250,31 +273,109 @@ class TranslateTitlesExtension extends Minz_Extension {
         FreshRSS_Context::$user_conf->save();
     }
 
-    public function translateTitle($entry) {
-        // CLI 模式下的特殊处理
-        if (php_sapi_name() == 'cli') {
-            if (!FreshRSS_Context::$user_conf) {
-                // 获取所有用户列表
-                $usernames = $this->listUsers();
-                foreach ($usernames as $username) {
-                    // 初始化用户配置
-                    FreshRSS_Context::$user_conf = new FreshRSS_UserConfiguration($username);
-                    FreshRSS_Context::$user_conf->load();
-                    break; // 只处理第一个用户
+    public function onEntryBeforeAdd($entry) {
+        error_log('[TT][HOOK] onEntryBeforeAdd');
+        return $this->processEntryForTranslation($entry, 'add');
+    }
+
+    public function onEntryBeforeUpdate($entry) {
+        error_log('[TT][HOOK] onEntryBeforeUpdate');
+        return $this->processEntryForTranslation($entry, 'update');
+    }
+
+    private function processEntryForTranslation($entry, $context = 'add') {
+        if (!is_object($entry)) {
+            return $entry;
+        }
+
+        if (php_sapi_name() === 'cli' && !FreshRSS_Context::$user_conf) {
+            $usernames = $this->listUsers();
+            foreach ($usernames as $username) {
+                FreshRSS_Context::$user_conf = new FreshRSS_UserConfiguration($username);
+                FreshRSS_Context::$user_conf->load();
+                break;
+            }
+        }
+
+        $feedId = $this->getFeedIdFromEntry($entry);
+        $entryKey = $this->makeEntrySignatureKey($entry);
+        error_log('[TT][FLOW][' . $context . '] entryKey=' . $entryKey . ' feedId=' . var_export($feedId, true));
+        if (!$this->isFeedTranslationEnabled($feedId)) {
+            error_log('[TT][FLOW][' . $context . '] feed disabled for translation');
+            return $entry;
+        }
+
+        $userConf = FreshRSS_Context::$user_conf;
+        $serviceType = $userConf->TranslateService ?? 'google';
+        $targetLang = strtolower((string)($userConf->TargetLang ?? 'zh-cn'));
+        $sourceLangMap = is_array($userConf->TranslateSourceLang ?? null) ? $userConf->TranslateSourceLang : [];
+        $sourceLang = isset($sourceLangMap[$feedId]) && $sourceLangMap[$feedId] !== '' ? $sourceLangMap[$feedId] : 'auto';
+
+        $translateTitleEnabled = (bool)($userConf->TranslateTitleEnabled ?? true);
+        $translateContentEnabled = (bool)($userConf->TranslateContentEnabled ?? false);
+        if (!$translateTitleEnabled && !$translateContentEnabled) {
+            error_log('[TT][FLOW][' . $context . '] both title/content translation disabled by user');
+            return $entry;
+        }
+
+        $displayMode = $userConf->ContentDisplayMode ?? 'orig_then_trans';
+        error_log('[TT][CONF] svc=' . $serviceType . ' target=' . $targetLang . ' source=' . $sourceLang . ' title=' . ($translateTitleEnabled ? '1' : '0') . ' content=' . ($translateContentEnabled ? '1' : '0') . ' mode=' . $displayMode);
+        $controller = new TranslateController();
+
+        if ($translateTitleEnabled && method_exists($entry, 'title')) {
+            $originalTitle = (string)$entry->title();
+            if ($this->shouldSkipTextForTarget($originalTitle, $targetLang)) {
+                error_log('[TT][TITLE][' . $context . '] skip by target-language heuristic');
+            }
+            if (!$this->shouldSkipTextForTarget($originalTitle, $targetLang)) {
+                try {
+                    $translatedTitle = $controller->translateTitle($originalTitle, $serviceType, $targetLang, $sourceLang);
+                } catch (Exception $e) {
+                    $translatedTitle = '';
+                    error_log('[TT][TITLE][' . $context . '] exception: ' . $e->getMessage());
+                }
+                if ($translatedTitle !== '' && $translatedTitle !== $originalTitle) {
+                    $newTitle = $this->buildTitleByDisplayMode($originalTitle, $translatedTitle, $displayMode);
+                    if ($newTitle !== null) {
+                        $entry->title($newTitle);
+                        error_log('[TT][TITLE][' . $context . '] feed=' . $feedId . ' mode=' . $displayMode);
+                    }
                 }
             }
         }
-        // 暂停标题翻译（等待新算法），直接返回
-        error_log('[TT] TITLE disabled');
-        return $entry;
-    }
 
-    /**
-     * Entry 展示前处理：按签名做“只翻一次，变更自动失效”，并包裹容器。
-     */
-    public function onEntryBeforeDisplay($entry) {
-        // 暂停正文翻译与容器/签名逻辑（等待新算法）
-        error_log('[TT] DISPLAY disabled');
+        if ($translateContentEnabled && method_exists($entry, 'content')) {
+            $currentContent = (string)$entry->content();
+            $existingSign = $this->extractWrapperSign($currentContent);
+            $contentForTranslate = $this->prepareContentForTranslation($currentContent);
+            $plainForCheck = strip_tags($contentForTranslate);
+            error_log('[TT][CONTENT][' . $context . '] existingSign=' . var_export($existingSign, true) . ' lenRaw=' . strlen((string)$currentContent) . ' lenPrepared=' . strlen((string)$contentForTranslate));
+
+            if ($this->isBlankText($plainForCheck) || $this->shouldSkipTextForTarget($plainForCheck, $targetLang)) {
+                error_log('[TT][CONTENT][' . $context . '] skip: blank or already target language');
+                return $entry;
+            }
+
+            $computedSign = $this->computeSignature($entryKey, $contentForTranslate, $targetLang, $serviceType, $displayMode);
+            if (!empty($existingSign) && $existingSign === $computedSign) {
+                error_log('[TT][CONTENT][' . $context . '] skip: signature match');
+                return $entry;
+            }
+
+            try {
+                [$translatedHtml, $stats] = $this->translateContentByParagraph($contentForTranslate, $targetLang, $serviceType, $sourceLang);
+            } catch (Exception $e) {
+                error_log('[TT][CONTENT][' . $context . '] exception: ' . $e->getMessage());
+                return $entry;
+            }
+
+            if (!empty($translatedHtml)) {
+                $wrapped = $this->buildWrapper($contentForTranslate, $translatedHtml, $computedSign, $displayMode);
+                $entry->content($wrapped);
+                error_log('[TT][CONTENT][' . $context . '] feed=' . $feedId . ' sign=' . $computedSign . ' stats=' . json_encode($stats, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            }
+        }
+
         return $entry;
     }
 
@@ -343,6 +444,109 @@ class TranslateTitlesExtension extends Minz_Extension {
         }
 
         return [$out, $stats];
+    }
+
+    private function prepareContentForTranslation($html) {
+        if ($this->hasTtcnWrapper($html)) {
+            $original = $this->extractOriginalFromWrapper($html);
+            if ($original !== null) {
+                return $original;
+            }
+            return $this->stripTtcnWrapper($html);
+        }
+        return $html;
+    }
+
+    private function getFeedIdFromEntry($entry) {
+        if (method_exists($entry, 'feedId')) {
+            $id = $entry->feedId();
+            if ($id !== null && $id !== '') {
+                return (string)$id;
+            }
+        }
+        if (method_exists($entry, 'feed')) {
+            $feed = $entry->feed();
+            if (is_object($feed)) {
+                if (method_exists($feed, 'id')) {
+                    $feedId = $feed->id();
+                    if ($feedId !== null && $feedId !== '') {
+                        return (string)$feedId;
+                    }
+                }
+                if (property_exists($feed, 'id') && $feed->id !== null && $feed->id !== '') {
+                    return (string)$feed->id;
+                }
+            }
+        }
+        if (property_exists($entry, 'feed_id') && $entry->feed_id !== null && $entry->feed_id !== '') {
+            return (string)$entry->feed_id;
+        }
+        return null;
+    }
+
+    private function isFeedTranslationEnabled($feedId) {
+        if ($feedId === null) {
+            return false;
+        }
+        $map = FreshRSS_Context::$user_conf->TranslateTitles ?? [];
+        return isset($map[$feedId]) && $map[$feedId] === '1';
+    }
+
+    private function makeEntrySignatureKey($entry) {
+        if (method_exists($entry, 'id')) {
+            $id = $entry->id();
+            if (!empty($id)) {
+                return (string)$id;
+            }
+        }
+        if (method_exists($entry, 'guid')) {
+            $guid = $entry->guid();
+            if (!empty($guid)) {
+                return (string)$guid;
+            }
+        }
+        if (method_exists($entry, 'hash')) {
+            $hash = $entry->hash();
+            if (!empty($hash)) {
+                return (string)$hash;
+            }
+        }
+        if (method_exists($entry, 'url')) {
+            $url = $entry->url();
+            if (!empty($url)) {
+                return sha1((string)$url);
+            }
+        }
+        return spl_object_hash($entry);
+    }
+
+    private function isTargetLanguageChinese($targetLang) {
+        $lang = strtolower((string)$targetLang);
+        return in_array($lang, ['zh', 'zh-cn', 'zh-hans', 'zh-hant', 'zh-tw'], true);
+    }
+
+    private function shouldSkipTextForTarget($text, $targetLang) {
+        $plain = trim(strip_tags((string)$text));
+        if ($this->isBlankText($plain)) {
+            return true;
+        }
+        if ($this->isTargetLanguageChinese($targetLang) && $this->containsChinese($plain)) {
+            return true;
+        }
+        return false;
+    }
+
+    private function buildTitleByDisplayMode($original, $translated, $displayMode) {
+        $displayMode = strtolower((string)$displayMode);
+        switch ($displayMode) {
+            case 'translated_only':
+                return $translated;
+            case 'trans_then_orig':
+                return $translated . ' | ' . $original;
+            case 'orig_then_trans':
+            default:
+                return $original . ' | ' . $translated;
+        }
     }
 
     private function stripTtcnWrapper($html) {
@@ -426,6 +630,246 @@ class TranslateTitlesExtension extends Minz_Extension {
         }
         $html .= '</div>';
         return $html;
+    }
+
+    private function forceUpdateFeed($feedId, $limit = 10) {
+        $feedId = (string)$feedId;
+        if ($feedId === '') {
+            return ['ok' => false, 'message' => '未提供订阅源 ID'];
+        }
+        $limit = max(1, (int)$limit);
+        $dao = null;
+        try {
+            $dao = FreshRSS_Factory::createEntryDao();
+        } catch (Exception $e) {
+            // ignore
+        }
+        if (!$dao) {
+            return ['ok' => false, 'message' => '无法获取 EntryDAO'];
+        }
+        error_log('[TT][FORCE] feed=' . $feedId . ' limit=' . $limit . ' dao=' . get_class($dao));
+        $entries = $this->listFeedEntries($dao, $feedId, $limit);
+        if (!is_array($entries) || empty($entries)) {
+            error_log('[TT][FORCE] feed=' . $feedId . ' no entries fetched');
+            return ['ok' => false, 'message' => '未获取到该源的条目或接口不兼容'];
+        }
+        error_log('[TT][FORCE] feed=' . $feedId . ' fetched entries=' . count($entries));
+
+        $updated = 0; $processed = 0; $errors = 0;
+        foreach ($entries as $entry) {
+            $processed++;
+            try {
+                $ek = $this->makeEntrySignatureKey($entry);
+                $raw = '';
+                // 准备：若已有包裹，取原文以触发重新翻译
+                if (method_exists($entry, 'content')) {
+                    $raw = (string)$entry->content();
+                    $prepared = $this->prepareContentForTranslation($raw);
+                    // 清空签名以确保不会命中“签名相同跳过”
+                    $rawNoSign = $this->stripTtcnWrapper($raw);
+                    $entry->content($rawNoSign);
+                }
+                error_log('[TT][FORCE] entry=' . $ek . ' rawLen=' . strlen((string)$raw));
+                // 直接走统一流程（使用 update 上下文），内部将根据配置翻译标题/正文并写回 entry 对象
+                $this->processEntryForTranslation($entry, 'force');
+
+                // 持久化：生成 DAO 更新数组并调用 updateEntry；兼容旧版则尝试 update($entry)
+                $saved = false;
+                if (method_exists($dao, 'updateEntry')) {
+                    $vals = $this->entryToDaoArray($entry);
+                    $saved = (bool)$dao->updateEntry($vals);
+                    error_log('[TT][FORCE] entry=' . $ek . ' save=updateEntry result=' . ($saved ? '1' : '0'));
+                } elseif (method_exists($dao, 'update')) {
+                    $saved = (bool)$dao->update($entry);
+                    error_log('[TT][FORCE] entry=' . $ek . ' save=update result=' . ($saved ? '1' : '0'));
+                } else {
+                    error_log('[TT][FORCE] entry=' . $ek . ' no save method available');
+                }
+                if ($saved) { $updated++; }
+            } catch (Exception $e) {
+                $errors++;
+                error_log('[TT][FORCE] entry error: ' . $e->getMessage());
+            }
+            if ($updated >= $limit) { break; }
+        }
+
+        $msg = '处理=' . $processed . ' 更新=' . $updated . ' 错误=' . $errors;
+        return ['ok' => $updated > 0, 'message' => $msg];
+    }
+
+    private function forceUpdateSelectedFeeds($limit = 10) {
+        $limit = max(1, (int)$limit);
+        $map = FreshRSS_Context::$user_conf->TranslateTitles ?? [];
+        if (!is_array($map) || empty($map)) {
+            return ['ok' => false, 'message' => '未选择任何订阅源'];
+        }
+        $feeds = [];
+        foreach ($map as $id => $flag) {
+            if ($flag === '1' || $flag === 1 || $flag === true) {
+                $feeds[] = (string)$id;
+            }
+        }
+        if (empty($feeds)) {
+            return ['ok' => false, 'message' => '未选择任何订阅源'];
+        }
+        error_log('[TT][FORCE] selected feeds=' . implode(',', $feeds) . ' limit=' . $limit);
+        $totalProcessed = 0; $totalUpdated = 0; $totalErrors = 0;
+        foreach ($feeds as $feedId) {
+            $res = $this->forceUpdateFeed($feedId, $limit);
+            $msg = $res['message'] ?? '';
+            error_log('[TT][FORCE] feed=' . $feedId . ' summary=' . $msg);
+            if (!empty($res['ok'])) {
+                if (preg_match('/处理=(\d+)\s+更新=(\d+)\s+错误=(\d+)/u', $msg, $m)) {
+                    $totalProcessed += (int)$m[1];
+                    $totalUpdated += (int)$m[2];
+                    $totalErrors += (int)$m[3];
+                }
+            }
+        }
+        $summary = '处理=' . $totalProcessed . ' 更新=' . $totalUpdated . ' 错误=' . $totalErrors;
+        return ['ok' => $totalUpdated > 0, 'message' => $summary];
+    }
+
+    private function listFeedEntries($dao, $feedId, $limit) {
+        $limit = max(1, (int)$limit);
+        $entries = [];
+        $cnt = function ($x) { return is_countable($x) ? count($x) : (is_array($x) ? count($x) : 0); };
+
+        if (method_exists($dao, 'listByFeed')) {
+            try {
+                $entries = $dao->listByFeed($feedId, 0, $limit);
+                error_log('[TT][FORCE][list] method=listByFeed count=' . $cnt($entries));
+            } catch (Throwable $e) {
+                error_log('[TT][FORCE][list] method=listByFeed exception=' . $e->getMessage());
+                $entries = [];
+            }
+        } else {
+            error_log('[TT][FORCE][list] method=listByFeed not exists');
+        }
+
+        if (empty($entries) && method_exists($dao, 'listEntries')) {
+            try {
+                // 尝试 feed 键名为 feed / id_feed
+                $crit = ['feed' => $feedId, 'order' => 'desc', 'limit' => $limit];
+                $entries = $dao->listEntries($crit);
+                if (empty($entries)) {
+                    $crit = ['id_feed' => (int)$feedId, 'order' => 'desc', 'limit' => $limit];
+                    $entries = $dao->listEntries($crit);
+                }
+                error_log('[TT][FORCE][list] method=listEntries count=' . $cnt($entries));
+            } catch (Throwable $e) {
+                error_log('[TT][FORCE][list] method=listEntries exception=' . $e->getMessage());
+                $entries = [];
+            }
+        } elseif (empty($entries)) {
+            error_log('[TT][FORCE][list] method=listEntries not exists');
+        }
+
+        if (empty($entries) && method_exists($dao, 'listWhere')) {
+            $feedIdInt = (int)$feedId;
+            // Preferred type keys across versions: 'f' (feed), 'feed', 'id_feed'
+            $types = ['f', 'feed', 'id_feed'];
+            $filtersCandidates = [null];
+            if (class_exists('FreshRSS_BooleanSearch')) {
+                try { $filtersCandidates[] = new FreshRSS_BooleanSearch(); } catch (Throwable $e) {}
+            }
+            $numberCandidates = [$limit, null];
+            $stateCandidates = $this->getEntryStateAllCandidates();
+
+            foreach ($types as $typeKey) {
+                foreach ($stateCandidates as $stateVal) {
+                    foreach ($filtersCandidates as $filtersVal) {
+                        foreach ($numberCandidates as $numVal) {
+                            try {
+                                // Correct positional signature:
+                                // (type, id, state, filters, id_min, id_max, sort, order, continuation_id, continuation_values, limit, offset)
+                                $tmp = $dao->listWhere($typeKey, $feedIdInt, $stateVal, $filtersVal, '0', '0', 'id', 'DESC', '0', [], ($numVal ?? $limit), 0);
+                                $c = ($tmp instanceof Traversable) ? 0 : $cnt($tmp);
+                                if ($tmp instanceof Traversable) {
+                                    // Convert to array but cap by limit
+                                    $collected = $this->iterToArrayLimit($tmp, $limit);
+                                    $c = count($collected);
+                                    $tmp = $collected;
+                                }
+                                error_log('[TT][FORCE][list] method=listWhere type=' . $typeKey . ' state=' . var_export($stateVal,true) . ' filters=' . (is_object($filtersVal)?get_class($filtersVal):'null') . ' number=' . var_export($numVal,true) . ' count=' . $c);
+                                if (!empty($tmp)) {
+                                    $entries = $tmp;
+                                    break 4;
+                                }
+                            } catch (Throwable $e) {
+                                error_log('[TT][FORCE][list] method=listWhere exception=' . $e->getMessage());
+                            }
+                        }
+                    }
+                }
+            }
+        } elseif (empty($entries)) {
+            error_log('[TT][FORCE][list] method=listWhere not exists');
+        }
+
+        return $entries;
+    }
+
+    private function iterToArrayLimit($iter, $limit) {
+        $out = [];
+        if ($iter instanceof Traversable) {
+            foreach ($iter as $e) {
+                $out[] = $e;
+                if (count($out) >= $limit) { break; }
+            }
+        }
+        return $out;
+    }
+
+    private function entryToDaoArray($entry) {
+        // Map a FreshRSS_Entry object to the array expected by EntryDAO::updateEntry()
+        // Provide sensible defaults to avoid missing bindings
+        $feedId = method_exists($entry, 'feedId') ? (int)$entry->feedId() : 0;
+        $guid = method_exists($entry, 'guid') ? (string)$entry->guid() : '';
+        $title = method_exists($entry, 'title') ? (string)$entry->title() : '';
+        // authors(true) returns a semicolon-joined string; fallback to empty string
+        $author = method_exists($entry, 'authors') ? (string)$entry->authors(true) : (method_exists($entry, 'author') ? (string)$entry->author() : '');
+        $content = method_exists($entry, 'content') ? (string)$entry->content() : '';
+        $link = method_exists($entry, 'link') ? (string)$entry->link(true) : '';
+        $date = method_exists($entry, 'date') ? (int)$entry->date(true) : time();
+        $lastSeen = method_exists($entry, 'lastSeen') ? (int)$entry->lastSeen() : time();
+        $lastUserModified = method_exists($entry, 'lastUserModified') ? (int)$entry->lastUserModified() : 0;
+        $hash = method_exists($entry, 'hash') ? (string)$entry->hash() : md5($link . $title . $author . $content);
+        $tags = method_exists($entry, 'tags') ? (string)$entry->tags(true) : '';
+        $attributes = method_exists($entry, 'attributes') ? $entry->attributes() : [];
+
+        return [
+            'id' => '0',
+            'id_feed' => $feedId,
+            'guid' => $guid,
+            'title' => $title,
+            'author' => $author,
+            'content' => $content,
+            'link' => $link,
+            'date' => $date,
+            'lastSeen' => $lastSeen,
+            'lastUserModified' => $lastUserModified,
+            'hash' => $hash,
+            'is_read' => null,
+            'is_favorite' => null,
+            'tags' => $tags,
+            'attributes' => $attributes,
+        ];
+    }
+
+    private function getEntryStateAllCandidates() {
+        $c = [];
+        foreach (['FreshRSS_Entry::STATE_ALL', 'FreshRSS_Entry::STATE_BOTH', 'FreshRSS_Entry::STATE_ALL_READ'] as $name) {
+            try { $v = @constant($name); if ($v !== null && $v !== false) { $c[] = (int)$v; } } catch (Throwable $e) {}
+        }
+        $read = @constant('FreshRSS_Entry::STATE_READ');
+        $notRead = @constant('FreshRSS_Entry::STATE_NOT_READ');
+        if (is_int($read) && is_int($notRead)) { $c[] = ($read | $notRead); }
+        $c[] = 0; // some versions treat 0 as all
+        $c[] = -1; // fallback
+        $out = [];
+        foreach ($c as $v) { if (!in_array($v, $out, true)) { $out[] = $v; } }
+        return $out;
     }
 
     private function getExtensionVersion() {
