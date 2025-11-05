@@ -275,15 +275,15 @@ class TranslateTitlesExtension extends Minz_Extension {
 
     public function onEntryBeforeAdd($entry) {
         error_log('[TT][HOOK] onEntryBeforeAdd');
-        return $this->processEntryForTranslation($entry, 'add');
+        return $this->processEntryForTranslation($entry, 'add', false);
     }
 
     public function onEntryBeforeUpdate($entry) {
         error_log('[TT][HOOK] onEntryBeforeUpdate');
-        return $this->processEntryForTranslation($entry, 'update');
+        return $this->processEntryForTranslation($entry, 'update', false);
     }
 
-    private function processEntryForTranslation($entry, $context = 'add') {
+    private function processEntryForTranslation($entry, $context = 'add', $force = false) {
         if (!is_object($entry)) {
             return $entry;
         }
@@ -308,7 +308,10 @@ class TranslateTitlesExtension extends Minz_Extension {
         $userConf = FreshRSS_Context::$user_conf;
         $serviceType = $userConf->TranslateService ?? 'google';
         $targetLang = strtolower((string)($userConf->TargetLang ?? 'zh-cn'));
-        $sourceLangMap = is_array($userConf->TranslateSourceLang ?? null) ? $userConf->TranslateSourceLang : [];
+        $sourceLangMap = [];
+        if (isset($userConf->TranslateSourceLang) && is_array($userConf->TranslateSourceLang)) {
+            $sourceLangMap = $userConf->TranslateSourceLang;
+        }
         $sourceLang = isset($sourceLangMap[$feedId]) && $sourceLangMap[$feedId] !== '' ? $sourceLangMap[$feedId] : 'auto';
 
         $translateTitleEnabled = (bool)($userConf->TranslateTitleEnabled ?? true);
@@ -322,26 +325,83 @@ class TranslateTitlesExtension extends Minz_Extension {
         error_log('[TT][CONF] svc=' . $serviceType . ' target=' . $targetLang . ' source=' . $sourceLang . ' title=' . ($translateTitleEnabled ? '1' : '0') . ' content=' . ($translateContentEnabled ? '1' : '0') . ' mode=' . $displayMode);
         $controller = new TranslateController();
 
-        if ($translateTitleEnabled && method_exists($entry, 'title')) {
-            $originalTitle = (string)$entry->title();
-            if ($this->shouldSkipTextForTarget($originalTitle, $targetLang)) {
-                error_log('[TT][TITLE][' . $context . '] skip by target-language heuristic');
+        $originalTitleCurrent = method_exists($entry, 'title') ? (string)$entry->title() : '';
+        $originalTitleSource = $originalTitleCurrent;
+        if (method_exists($entry, 'attributeString')) {
+            $storedTitle = $entry->attributeString('ttcn_original_title');
+            if ($storedTitle !== null && $storedTitle !== '') {
+                $originalTitleSource = $storedTitle;
+            } elseif (method_exists($entry, '_attribute')) {
+                $entry->_attribute('ttcn_original_title', $originalTitleCurrent);
             }
-            if (!$this->shouldSkipTextForTarget($originalTitle, $targetLang)) {
+        }
+
+        if ($translateTitleEnabled && method_exists($entry, 'title')) {
+            // 标题在 update 时的幂等保护：上游未变更则复用历史译文，避免重复请求
+            if ($context === 'update' && !$force) {
+                try { $prev = $this->loadStoredEntryForCompare($entry, $feedId); } catch (Throwable $e) { $prev = null; }
+                if ($prev) {
+                    $prevOrig = null;
+                    if (method_exists($prev, 'attributeString')) {
+                        $prevOrig = $prev->attributeString('ttcn_original_title');
+                    }
+                    if (!empty($prevOrig)) {
+                        $normPrev = $this->normalizeForSign((string)$prevOrig);
+                        $normCurr = $this->normalizeForSign((string)$originalTitleSource);
+                        if ($normPrev === $normCurr) {
+                            $prevTrans = method_exists($prev, 'attributeString') ? $prev->attributeString('ttcn_translated_title') : '';
+                            if (!empty($prevTrans)) {
+                                $rebuiltTitle = $this->buildTitleByDisplayMode($prevOrig, $prevTrans, $displayMode);
+                                if (method_exists($entry, '_title')) { $entry->_title($rebuiltTitle); } else { $entry->title = $rebuiltTitle; }
+                                error_log('[TT][TITLE][' . $context . '] unchanged upstream: reused previous translation');
+                                // 确保属性仍在
+                                if (method_exists($entry, '_attribute')) {
+                                    $entry->_attribute('ttcn_original_title', $prevOrig);
+                                    $entry->_attribute('ttcn_translated_title', $prevTrans);
+                                }
+                                // 跳过翻译调用
+                                goto SKIP_TITLE_TRANSLATION;
+                            } else {
+                                // 无已存译文则复用上次最终显示标题
+                                $prevDisplay = method_exists($prev, 'title') ? (string)$prev->title() : '';
+                                if ($prevDisplay !== '') {
+                                    if (method_exists($entry, '_title')) { $entry->_title($prevDisplay); } else { $entry->title = $prevDisplay; }
+                                    error_log('[TT][TITLE][' . $context . '] unchanged upstream: reused previous display title');
+                                    goto SKIP_TITLE_TRANSLATION;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!$force && $this->shouldSkipTextForTarget($originalTitleSource, $targetLang)) {
+                error_log('[TT][TITLE][' . $context . '] skip by target-language heuristic');
+            } else {
                 try {
-                    $translatedTitle = $controller->translateTitle($originalTitle, $serviceType, $targetLang, $sourceLang);
+                    $translatedTitle = $controller->translateTitle($originalTitleSource, $serviceType, $targetLang, $sourceLang);
                 } catch (Exception $e) {
                     $translatedTitle = '';
                     error_log('[TT][TITLE][' . $context . '] exception: ' . $e->getMessage());
                 }
-                if ($translatedTitle !== '' && $translatedTitle !== $originalTitle) {
-                    $newTitle = $this->buildTitleByDisplayMode($originalTitle, $translatedTitle, $displayMode);
+                if ($translatedTitle !== '' && $translatedTitle !== $originalTitleSource) {
+                    $newTitle = $this->buildTitleByDisplayMode($originalTitleSource, $translatedTitle, $displayMode);
                     if ($newTitle !== null) {
-                        $entry->title($newTitle);
+                        if (method_exists($entry, '_title')) {
+                            $entry->_title($newTitle);
+                        } else {
+                            $entry->title = $newTitle;
+                        }
+                        // 存储原题与译题，便于后续重载复用
+                        if (method_exists($entry, '_attribute')) {
+                            $entry->_attribute('ttcn_original_title', $originalTitleSource);
+                            $entry->_attribute('ttcn_translated_title', $translatedTitle);
+                        }
                         error_log('[TT][TITLE][' . $context . '] feed=' . $feedId . ' mode=' . $displayMode);
                     }
                 }
             }
+            SKIP_TITLE_TRANSLATION:;
         }
 
         if ($translateContentEnabled && method_exists($entry, 'content')) {
@@ -356,8 +416,41 @@ class TranslateTitlesExtension extends Minz_Extension {
                 return $entry;
             }
 
+            // Idempotent reload handling: if upstream content is unchanged, avoid re-translation.
+            if ($context === 'update' && !$force) {
+                try {
+                    $prev = $this->loadStoredEntryForCompare($entry, $feedId);
+                } catch (Throwable $e) { $prev = null; }
+                if ($prev && method_exists($prev, 'content')) {
+                    $prevRaw = (string)$prev->content(false);
+                    $prevPrepared = $this->prepareContentForTranslation($prevRaw);
+                    $oldBase = $this->normalizeForSign($prevPrepared);
+                    $newBase = $this->normalizeForSign($contentForTranslate);
+                    if ($oldBase === $newBase) {
+                        if ($this->hasTtcnWrapper($prevRaw)) {
+                            $origPrev = $this->extractOriginalFromWrapper($prevRaw);
+                            $transPrev = $this->extractTranslatedFromWrapper($prevRaw);
+                            if ($origPrev !== null && $transPrev !== null) {
+                                $rebuiltSign = $this->computeSignature($entryKey, $contentForTranslate, $targetLang, $serviceType, $displayMode);
+                                $rebuilt = $this->buildWrapper($contentForTranslate, $transPrev, $rebuiltSign, $displayMode);
+                                if (method_exists($entry, '_content')) { $entry->_content($rebuilt); } else { $entry->content = $rebuilt; }
+                                error_log('[TT][CONTENT][' . $context . '] unchanged upstream: reused previous translation (rebuilt wrapper)');
+                                return $entry;
+                            } else {
+                                if (method_exists($entry, '_content')) { $entry->_content($prevRaw); } else { $entry->content = $prevRaw; }
+                                error_log('[TT][CONTENT][' . $context . '] unchanged upstream: reused previous wrapper (raw)');
+                                return $entry;
+                            }
+                        } else {
+                            error_log('[TT][CONTENT][' . $context . '] unchanged upstream: skip translation (no previous wrapper)');
+                            return $entry;
+                        }
+                    }
+                }
+            }
+
             $computedSign = $this->computeSignature($entryKey, $contentForTranslate, $targetLang, $serviceType, $displayMode);
-            if (!empty($existingSign) && $existingSign === $computedSign) {
+            if (!$force && !empty($existingSign) && $existingSign === $computedSign) {
                 error_log('[TT][CONTENT][' . $context . '] skip: signature match');
                 return $entry;
             }
@@ -371,7 +464,12 @@ class TranslateTitlesExtension extends Minz_Extension {
 
             if (!empty($translatedHtml)) {
                 $wrapped = $this->buildWrapper($contentForTranslate, $translatedHtml, $computedSign, $displayMode);
-                $entry->content($wrapped);
+                error_log('[TT][CONTENT][' . $context . '] wrappedSnippet=' . mb_substr(strip_tags($wrapped), 0, 160, 'UTF-8'));
+                if (method_exists($entry, '_content')) {
+                    $entry->_content($wrapped);
+                } else {
+                    $entry->content = $wrapped;
+                }
                 error_log('[TT][CONTENT][' . $context . '] feed=' . $feedId . ' sign=' . $computedSign . ' stats=' . json_encode($stats, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
             }
         }
@@ -389,16 +487,7 @@ class TranslateTitlesExtension extends Minz_Extension {
 
     private function translateContentByParagraph($html, $targetLang, $serviceType, $sourceLang = 'auto') {
         $controller = new TranslateController();
-
-        $paragraphs = [];
-        $matches = [];
-        if (preg_match_all('/<p[^>]*>(.*?)<\/p>/is', $html, $matches)) {
-            $paragraphs = $matches[1];
-        } else {
-            // 退化：按空行分段（对纯文本或无 <p> 的内容）
-            $text = strip_tags($html);
-            $paragraphs = preg_split('/\R{2,}/u', $text);
-        }
+        $pattern = '/<(?P<tag>p|li|blockquote|pre|h[1-6])(?P<attr>[^>]*)>(?P<body>.*?)<\/(?P=tag)>/is';
 
         $stats = [
             'total' => 0,
@@ -407,43 +496,75 @@ class TranslateTitlesExtension extends Minz_Extension {
             'failed' => 0,
         ];
 
-        $translatedParts = [];
-        foreach ($paragraphs as $p) {
-            $stats['total']++;
-            $text = trim(strip_tags($p));
-            if ($this->isBlankText($text)) {
-                $stats['skip_blank']++;
-                $translatedParts[] = $text; // 保持空白
-                continue;
+        if (!preg_match_all($pattern, $html, $matches, PREG_OFFSET_CAPTURE)) {
+            $plain = trim(strip_tags($html));
+            if ($plain === '' || $this->containsChinese($plain)) {
+                if ($plain === '') {
+                    $stats['skip_blank']++;
+                } else {
+                    $stats['skip_cn']++;
+                }
+                return [$html, $stats];
             }
-            if ($this->containsChinese($text)) {
-                $stats['skip_cn']++;
-                $translatedParts[] = $text; // 中文段落直接保留
-                continue;
-            }
-
-            // 调用翻译（单段）
-            $translated = '';
             try {
-                $translated = $controller->translateTitle($text, $serviceType, $targetLang, $sourceLang);
+                $translated = $controller->translateTitle($plain, $serviceType, $targetLang, $sourceLang);
             } catch (Exception $e) {
                 $translated = '';
             }
-            if ($translated === '' || $translated === null) {
+            if ($translated === '') {
                 $stats['failed']++;
-                $translatedParts[] = $text; // 失败则保留原文
-            } else {
-                $translatedParts[] = $translated;
+                return [$html, $stats];
             }
+            $stats['total'] = 1;
+            $escaped = htmlspecialchars($translated, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $escaped = preg_replace("/\r\n|\r|\n/", '<br />', $escaped);
+            return ['<p>' . $escaped . '</p>', $stats];
         }
 
-        // 重新组装为简单 <p> 段落
-        $out = '';
-        foreach ($translatedParts as $tp) {
-            $out .= '<p>' . htmlspecialchars($tp, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+        $result = '';
+        $lastPos = 0;
+        $matchCount = count($matches[0]);
+        for ($i = 0; $i < $matchCount; $i++) {
+            $full = $matches[0][$i][0];
+            $start = $matches[0][$i][1];
+            $result .= substr($html, $lastPos, $start - $lastPos);
+
+            $tag = strtolower($matches['tag'][$i][0]);
+            $attr = $matches['attr'][$i][0];
+            $attrString = trim($attr);
+            $attrString = $attrString === '' ? '' : ' ' . $attrString;
+            $body = $matches['body'][$i][0];
+            $text = trim(strip_tags($body));
+
+            $stats['total']++;
+            if ($text === '') {
+                $stats['skip_blank']++;
+                $result .= $full;
+            } elseif ($this->containsChinese($text)) {
+                $stats['skip_cn']++;
+                $result .= $full;
+            } else {
+                $translated = '';
+                try {
+                    $translated = $controller->translateTitle($text, $serviceType, $targetLang, $sourceLang);
+                } catch (Exception $e) {
+                    $translated = '';
+                }
+                if ($translated === '') {
+                    $stats['failed']++;
+                    $result .= $full;
+                } else {
+                    $escaped = htmlspecialchars($translated, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                    $escaped = preg_replace("/\r\n|\r|\n/", '<br />', $escaped);
+                    $result .= '<' . $tag . $attrString . '>' . $escaped . '</' . $tag . '>';
+                }
+            }
+
+            $lastPos = $start + strlen($full);
         }
 
-        return [$out, $stats];
+        $result .= substr($html, $lastPos);
+        return [$result, $stats];
     }
 
     private function prepareContentForTranslation($html) {
@@ -592,6 +713,13 @@ class TranslateTitlesExtension extends Minz_Extension {
         return null;
     }
 
+    private function extractTranslatedFromWrapper($html) {
+        if (preg_match('/<div[^>]*class="[^"]*ttcn-translated[^"]*"[^>]*>([\s\S]*?)<\/div>/i', $html, $m)) {
+            return $m[1];
+        }
+        return null;
+    }
+
     private function normalizeForSign($html) {
         // 去容器、去标签、压缩空白，得到稳定文本
         $plain = strip_tags($this->stripTtcnWrapper($html));
@@ -671,12 +799,13 @@ class TranslateTitlesExtension extends Minz_Extension {
                 }
                 error_log('[TT][FORCE] entry=' . $ek . ' rawLen=' . strlen((string)$raw));
                 // 直接走统一流程（使用 update 上下文），内部将根据配置翻译标题/正文并写回 entry 对象
-                $this->processEntryForTranslation($entry, 'force');
+                $this->processEntryForTranslation($entry, 'force', true);
 
                 // 持久化：生成 DAO 更新数组并调用 updateEntry；兼容旧版则尝试 update($entry)
                 $saved = false;
                 if (method_exists($dao, 'updateEntry')) {
                     $vals = $this->entryToDaoArray($entry);
+                    error_log('[TT][FORCE] entry=' . $ek . ' daoSnippet=' . mb_substr(strip_tags((string)($vals['content'] ?? '')), 0, 160, 'UTF-8'));
                     $saved = (bool)$dao->updateEntry($vals);
                     error_log('[TT][FORCE] entry=' . $ek . ' save=updateEntry result=' . ($saved ? '1' : '0'));
                 } elseif (method_exists($dao, 'update')) {
@@ -685,7 +814,23 @@ class TranslateTitlesExtension extends Minz_Extension {
                 } else {
                     error_log('[TT][FORCE] entry=' . $ek . ' no save method available');
                 }
-                if ($saved) { $updated++; }
+                if ($saved) {
+                    $updated++;
+                    try {
+                        $verify = null;
+                        if (method_exists($dao, 'searchByGuid') && method_exists($entry, 'guid')) {
+                            $verify = $dao->searchByGuid((int)$feedId, (string)$entry->guid());
+                        } elseif (method_exists($dao, 'searchById') && method_exists($entry, 'id')) {
+                            $verify = $dao->searchById((string)$entry->id());
+                        }
+                        if ($verify && method_exists($verify, 'content')) {
+                            $snippet = substr(strip_tags((string)$verify->content(false)), 0, 120);
+                            error_log('[TT][FORCE] entry=' . $ek . ' verifySnippet=' . $snippet);
+                        }
+                    } catch (Throwable $e) {
+                        error_log('[TT][FORCE] entry=' . $ek . ' verify exception=' . $e->getMessage());
+                    }
+                }
             } catch (Exception $e) {
                 $errors++;
                 error_log('[TT][FORCE] entry error: ' . $e->getMessage());
@@ -727,7 +872,37 @@ class TranslateTitlesExtension extends Minz_Extension {
             }
         }
         $summary = '处理=' . $totalProcessed . ' 更新=' . $totalUpdated . ' 错误=' . $totalErrors;
+        if ($totalUpdated > 0 && class_exists('FreshRSS_UserDAO')) {
+            try { FreshRSS_UserDAO::touch(); } catch (Throwable $e) {}
+        }
         return ['ok' => $totalUpdated > 0, 'message' => $summary];
+    }
+
+    private function loadStoredEntryForCompare($entry, $feedId) {
+        try {
+            $dao = FreshRSS_Factory::createEntryDao();
+        } catch (Throwable $e) { return null; }
+        if (!$dao) { return null; }
+        // Prefer GUID lookup when available
+        try {
+            if (method_exists($entry, 'guid') && method_exists($dao, 'searchByGuid')) {
+                $guid = (string)$entry->guid();
+                if ($guid !== '') {
+                    $found = $dao->searchByGuid((int)$feedId, $guid);
+                    if ($found) { return $found; }
+                }
+            }
+        } catch (Throwable $e) {}
+        try {
+            if (method_exists($entry, 'id') && method_exists($dao, 'searchById')) {
+                $id = $entry->id();
+                if ($id !== null && $id !== '') {
+                    $found = $dao->searchById((string)$id);
+                    if ($found) { return $found; }
+                }
+            }
+        } catch (Throwable $e) {}
+        return null;
     }
 
     private function listFeedEntries($dao, $feedId, $limit) {
@@ -767,31 +942,29 @@ class TranslateTitlesExtension extends Minz_Extension {
 
         if (empty($entries) && method_exists($dao, 'listWhere')) {
             $feedIdInt = (int)$feedId;
-            // Preferred type keys across versions: 'f' (feed), 'feed', 'id_feed'
-            $types = ['f', 'feed', 'id_feed'];
+            // FreshRSS listWhere $type 使用单字母，feed 对应 'f'
+            $typeKey = 'f';
             $filtersCandidates = [null];
             if (class_exists('FreshRSS_BooleanSearch')) {
                 try { $filtersCandidates[] = new FreshRSS_BooleanSearch(); } catch (Throwable $e) {}
             }
             $numberCandidates = [$limit, null];
             $stateCandidates = $this->getEntryStateAllCandidates();
+            $sortCandidates = ['id', 'date', 'lastUserModified'];
 
-            foreach ($types as $typeKey) {
-                foreach ($stateCandidates as $stateVal) {
-                    foreach ($filtersCandidates as $filtersVal) {
-                        foreach ($numberCandidates as $numVal) {
+            foreach ($stateCandidates as $stateVal) {
+                foreach ($filtersCandidates as $filtersVal) {
+                    foreach ($numberCandidates as $numVal) {
+                        foreach ($sortCandidates as $sortVal) {
                             try {
-                                // Correct positional signature:
-                                // (type, id, state, filters, id_min, id_max, sort, order, continuation_id, continuation_values, limit, offset)
-                                $tmp = $dao->listWhere($typeKey, $feedIdInt, $stateVal, $filtersVal, '0', '0', 'id', 'DESC', '0', [], ($numVal ?? $limit), 0);
+                                $tmp = $dao->listWhere($typeKey, $feedIdInt, $stateVal, $filtersVal, '0', '0', $sortVal, 'DESC', '0', [], ($numVal ?? $limit), 0);
                                 $c = ($tmp instanceof Traversable) ? 0 : $cnt($tmp);
                                 if ($tmp instanceof Traversable) {
-                                    // Convert to array but cap by limit
                                     $collected = $this->iterToArrayLimit($tmp, $limit);
                                     $c = count($collected);
                                     $tmp = $collected;
                                 }
-                                error_log('[TT][FORCE][list] method=listWhere type=' . $typeKey . ' state=' . var_export($stateVal,true) . ' filters=' . (is_object($filtersVal)?get_class($filtersVal):'null') . ' number=' . var_export($numVal,true) . ' count=' . $c);
+                                error_log('[TT][FORCE][list] method=listWhere type=' . $typeKey . ' state=' . var_export($stateVal,true) . ' filters=' . (is_object($filtersVal)?get_class($filtersVal):'null') . ' number=' . var_export($numVal,true) . ' sort=' . $sortVal . ' count=' . $c);
                                 if (!empty($tmp)) {
                                     $entries = $tmp;
                                     break 4;
@@ -826,16 +999,25 @@ class TranslateTitlesExtension extends Minz_Extension {
         // Provide sensible defaults to avoid missing bindings
         $feedId = method_exists($entry, 'feedId') ? (int)$entry->feedId() : 0;
         $guid = method_exists($entry, 'guid') ? (string)$entry->guid() : '';
+        $guid = substr($guid, 0, 767);
         $title = method_exists($entry, 'title') ? (string)$entry->title() : '';
+        $title = mb_strcut($title, 0, 8192, 'UTF-8');
         // authors(true) returns a semicolon-joined string; fallback to empty string
         $author = method_exists($entry, 'authors') ? (string)$entry->authors(true) : (method_exists($entry, 'author') ? (string)$entry->author() : '');
-        $content = method_exists($entry, 'content') ? (string)$entry->content() : '';
+        $author = mb_strcut($author, 0, 1024, 'UTF-8');
+        $content = method_exists($entry, 'content') ? (string)$entry->content(false) : '';
         $link = method_exists($entry, 'link') ? (string)$entry->link(true) : '';
         $date = method_exists($entry, 'date') ? (int)$entry->date(true) : time();
-        $lastSeen = method_exists($entry, 'lastSeen') ? (int)$entry->lastSeen() : time();
+        $now = time();
+        $lastSeen = method_exists($entry, 'lastSeen') ? (int)$entry->lastSeen() : $now;
+        if ($lastSeen <= 0) { $lastSeen = $now; }
         $lastUserModified = method_exists($entry, 'lastUserModified') ? (int)$entry->lastUserModified() : 0;
+        if ($lastUserModified <= 0) { $lastUserModified = $now; } else { $lastUserModified = max($lastUserModified, $now); }
         $hash = method_exists($entry, 'hash') ? (string)$entry->hash() : md5($link . $title . $author . $content);
+        $isRead = method_exists($entry, 'isRead') ? $entry->isRead() : null;
+        $isFavorite = method_exists($entry, 'isFavorite') ? $entry->isFavorite() : null;
         $tags = method_exists($entry, 'tags') ? (string)$entry->tags(true) : '';
+        $tags = mb_strcut($tags, 0, 2048, 'UTF-8');
         $attributes = method_exists($entry, 'attributes') ? $entry->attributes() : [];
 
         return [
@@ -850,8 +1032,8 @@ class TranslateTitlesExtension extends Minz_Extension {
             'lastSeen' => $lastSeen,
             'lastUserModified' => $lastUserModified,
             'hash' => $hash,
-            'is_read' => null,
-            'is_favorite' => null,
+            'is_read' => $isRead,
+            'is_favorite' => $isFavorite,
             'tags' => $tags,
             'attributes' => $attributes,
         ];
@@ -859,12 +1041,17 @@ class TranslateTitlesExtension extends Minz_Extension {
 
     private function getEntryStateAllCandidates() {
         $c = [];
+        // Common "ALL" variants
         foreach (['FreshRSS_Entry::STATE_ALL', 'FreshRSS_Entry::STATE_BOTH', 'FreshRSS_Entry::STATE_ALL_READ'] as $name) {
             try { $v = @constant($name); if ($v !== null && $v !== false) { $c[] = (int)$v; } } catch (Throwable $e) {}
         }
+        // Individual flags
         $read = @constant('FreshRSS_Entry::STATE_READ');
         $notRead = @constant('FreshRSS_Entry::STATE_NOT_READ');
+        if (is_int($read)) { $c[] = (int)$read; }
+        if (is_int($notRead)) { $c[] = (int)$notRead; }
         if (is_int($read) && is_int($notRead)) { $c[] = ($read | $notRead); }
+        // Generic fallbacks
         $c[] = 0; // some versions treat 0 as all
         $c[] = -1; // fallback
         $out = [];
